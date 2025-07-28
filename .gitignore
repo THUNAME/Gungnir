@@ -1,0 +1,8 @@
+
+*.pyc
+nohup.out
+__pycache__/
+state/**
+Prediction/**
+model/**
+data/**
