@@ -17,7 +17,6 @@ from torch.nn.utils.rnn import pad_sequence
 
 import logging
 
-# 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
@@ -46,10 +45,10 @@ class FocalLoss(nn.Module):
 
 
 def train():
-    # 设置随机种子以保证结果可重复性
+    # Set random seed to ensure reproducibility of results
     torch.manual_seed(0)
     np.random.seed(0)
-    # 设置设备为GPU或CPU
+    # Set device to GPU or CPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     
@@ -66,22 +65,23 @@ def train():
         # 6:active_type, 2:category, 3:sub_category, 1:org_name, 0:asnum, 4:routing_prefix, 5:prefix
         
         tokenized_data = tokenize_trainingdata(csv_data, tokendict.vocab)
+        tokenized_data = tokenize_trainingdata(csv_data, tokendict.vocab)
         tokenized_Dataset.append(tokenized_data)
     
     
-    # # 计算每个序列的长度
+    # # Calculate the length of each sequence
     # input_seqlens = [len(tokenized_Dataset[i]) for i in range(len(tokenized_Dataset))]
-    # # 对序列进行左填充，使得所有序列长度一致
+    # # Left pad the sequences to make all sequences have the same length
     # tokenized_Dataset = left_pad_sequences(tokenized_Dataset, tokendict.vocab)
     
     
-    # 定义数据集和数据加载器
+    # Define dataset and data loader
     dataset = MyDataset(tokenized_Dataset,tokendict.vocab)
     dataloader = DataLoader(dataset, batch_size=512, shuffle=True,collate_fn=collate_fn)
 
 
     model = load_model(config=config,tokendict=tokendict)
-    criterion = nn.CrossEntropyLoss(ignore_index=tokendict.vocab["PAD_TOKEN"]).to(device)  # 使用ignore_index忽略填充token
+    criterion = nn.CrossEntropyLoss(ignore_index=tokendict.vocab["PAD_TOKEN"]).to(device)  # Use ignore_index to ignore padding token
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     num_epochs = 1
@@ -94,8 +94,8 @@ def train():
             
             optimizer.zero_grad()
             outputs = model(input_sequences_left, mask , src_key_padding_mask = input_sequences_left_mask)
-            # 由于输出是 [batch_size, seq_len, output_size]
-            # 我们需要将 outputs 和 batch_labels 重塑以适应 CrossEntropyLoss
+            # Since the output is [batch_size, seq_len, output_size]
+            # We need to reshape outputs and batch_labels to fit CrossEntropyLoss
             outputs = outputs.view(-1, model.output_size)  # [batch_size * seq_len, output_size]
             
             target_sequences_left = target_sequences_left.reshape(-1)  # [batch_size * seq_len]
@@ -107,7 +107,7 @@ def train():
             running_loss += loss.item()
         logging.info(f'Epoch {epoch + 1} Loss: {running_loss / len(dataloader)}')
     
-        # 假设已经完成了模型的训练，model是你的TransformerModel实例
+        # Assuming the model training is complete, model is your TransformerModel instance
         torch.save(model.state_dict(), config["model_path"]+".pth")
     logging.info('Model saved!')
     return model
@@ -115,26 +115,26 @@ def train():
 
 
 def collate_fn(batch):
-    # 在每个样本开头添加START_TOKEN
+    # Add START_TOKEN at the beginning of each sample
     # vocab["START_TOKEN"]=2
     # vocab["PAD_TOKEN"]=5
     
-    device = batch[0].device  # 获取第一个样本的设备
+    device = batch[0].device  # Get the device of the first sample
     sequences = [torch.cat([
-        torch.tensor([2], device=device),  # 添加起始标记，并确保它在正确的设备上
-        sample.to(device)  # 将样本移动到正确的设备上
+        torch.tensor([2], device=device),  # Add start token and ensure it's on the correct device
+        sample.to(device)  # Move the sample to the correct device
     ]) for sample in batch]
     
     
-    # 左填充
-    reversed_seqs = [torch.flip(seq, [0]) for seq in sequences]  # 第一次反转
+    # Left padding
+    reversed_seqs = [torch.flip(seq, [0]) for seq in sequences]  # First reversal
     padded_reversed = pad_sequence(reversed_seqs, 
                                  batch_first=True, 
-                                 padding_value=5)  # 右侧填充反转后的序列
-    padded_sequences_left = torch.flip(padded_reversed, [1])  # 第二次反转
+                                 padding_value=5)  # Right padding the reversed sequences
+    padded_sequences_left = torch.flip(padded_reversed, [1])  # Second reversal
     
-    input_sequences_left = padded_sequences_left[:, :-1]  # 取出输入序列
-    target_sequences_left = padded_sequences_left[:, 1:]  # 取出目标序列
+    input_sequences_left = padded_sequences_left[:, :-1]  # Extract input sequences
+    target_sequences_left = padded_sequences_left[:, 1:]  # Extract target sequences
     
     
     input_sequences_left_mask = (input_sequences_left != 5).float()

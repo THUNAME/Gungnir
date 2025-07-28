@@ -22,35 +22,46 @@ def trans_into_bin(routingprefix):
     return routing_binary_representation[:length]
 
 def make_Prediction(config,tokendict,model):
-    
+    # Load the lookup table from the specified file in the configuration
 
     lookuptable=load_lookuptable(config["lookuptablefile"])
     
+    # Open the routing prefix file for reading
     file = open(config["routingprefix_file"])
 
     
+    # Open the prediction file for writing the results
     with open(config["Prediction_path"], 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
+        # Iterate through each line in the routing prefix file
         for line in file:
             try:
+                # Strip any leading/trailing whitespace from the line
                 line=line.strip()
+                # Split the line into routing prefix and AS number
                 routingprefix,as_num=line.split("	")
+                # Find the corresponding entry in the lookup table for the AS number
                 found=lookuptable[lookuptable['as'] == int(as_num)]
-                # 0:asnum, 1:org_name, 2:category, 3:sub_category, 4:routing_prefix, 5:prefix, 6:active_type
+                # Define the token structure: 0:asnum, 1:org_name, 2:category, 3:sub_category, 4:routing_prefix, 5:prefix, 6:active_type
                 if found.empty:
+                    # If no entry is found, use default values and the binary representation of the routing prefix
                     input_token=[as_num,"PAD_TOKEN","PAD_TOKEN","PAD_TOKEN"]
                     input_token.append(trans_into_bin(routingprefix))
                 else:
+                    # If an entry is found, use its values and the binary representation of the routing prefix
                     input_token=found.iloc[0].tolist()
                     input_token.append(trans_into_bin(routingprefix))
+                # Append a constant value "TCP_443" to the token list
                 input_token.append("TCP_443")
-                # 逐行写入列表中的数据
+                # Write the token list to the prediction file
                 writer.writerow(input_token)
             except Exception as e:
+                # Print the line and error message if an exception occurs
                 print(line)
                 print(e)
             
 
+    # Close the opened files
     csvfile.close()
     file.close()
         

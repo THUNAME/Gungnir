@@ -110,18 +110,27 @@ def checkFrp(config,prefix_set):
 
 
 def split_set_into_chunks(original_set, num_chunks):
-    chunk_size = len(original_set) // num_chunks
-    chunks = [set() for _ in range(num_chunks)]
-    iterator = iter(original_set)
+    """
+    Splits the given set into the specified number of chunks.
+    
+    Args:
+        original_set (set): The set to be split.
+        num_chunks (int): The number of chunks to split the set into.
+    
+    Returns:
+        list: A list of sets, where each set is a chunk of the original set.
+    """
+    chunk_size = len(original_set) // num_chunks  # Calculate the size of each chunk
+    chunks = [set() for _ in range(num_chunks)]  # Initialize a list of empty sets for chunks
+    iterator = iter(original_set)  # Create an iterator for the original set
     
     for i in range(num_chunks):
-        chunks[i].update(islice(iterator, chunk_size))
+        chunks[i].update(islice(iterator, chunk_size))  # Distribute elements to each chunk
     
-    # 处理剩余的元素
-    for element in iterator:
-        chunks[0].add(element)
+    for element in iterator:  # Handle any remaining elements
+        chunks[0].add(element)  # Add remaining elements to the first chunk
     
-    return chunks
+    return chunks  # Return the list of chunks
 
     
 
@@ -137,34 +146,54 @@ def make_jump_prefix(line,jump_length=4):
 
 
 def jump_outoftrap(prefix_dict,total_budget,config):
+    # Print the number of prefixes to be checked
     print("to be checked ",len(prefix_dict))
     
+    # Initialize an empty set to store the FRP prefixes
     prefix_set=set()
+    # Initialize a dictionary to map original prefixes to their jump prefixes
     prefix2jumpprefix=dict()
     
+    # Iterate through the prefix dictionary
     for prefix,trap_length in list(prefix_dict.items()):
+        # Check if the trap length is greater than or equal to 1
         if trap_length>=1:
+            # Split the prefix into address and length
             address,length=prefix.split("/")
             length=int(length)
+            # Calculate the new length after subtracting the trap length
             length-=trap_length
+            # Form the new FRP prefix
             frp=address+"/"+str(length)
+            # Add the FRP prefix to the set
             prefix_set.add(frp)
+            # Map the original prefix to its jump prefix
             prefix2jumpprefix[prefix]=frp
         else:
+            # Delete the prefix from the dictionary if trap length is less than 1
             del prefix_dict[prefix]
 
+    # Check the FRP prefixes against the given configuration
     FRP_set = checkFrp(config, prefix_set)
+    # Update the total budget by adding the number of prefixes in the set
     total_budget+=len(prefix_set)
+    # Save the FRP set to a file
     save_to_file(FRP_set)
     
+    # Iterate through the mapping of original prefixes to jump prefixes
     for prefix,jumpprefix in list(prefix2jumpprefix.items()):
+        # Check if the jump prefix is in the FRP set
         if jumpprefix in FRP_set:
+            # Update the prefix dictionary with the jump prefix
             prefix_dict[jumpprefix]=prefix_dict[prefix]
+            # Delete the original prefix from the dictionary
             del prefix_dict[prefix]
         else:
+            # Halve the trap length for the original prefix if its jump prefix is not in the FRP set
             prefix_dict[prefix]/=2
             
     
+    # Return the updated total budget and prefix dictionary
     return total_budget,prefix_dict
  
    

@@ -10,11 +10,13 @@ from Tools import add_new_data_to_df
 
 
 class Environment:
+    """Environment class to handle IPv6 prefixes and their binary representations."""
     def __init__(self,config):
+        """Initialize the Environment with a config file."""
         Frp_filename=config["seedfile"]
         
-        self.FRP_Area=set()
-        self.known_Area=set()
+        self.FRP_Area=set()  # Set to store FRP prefixes
+        self.known_Area=set()  # Set to store known prefixes
         
         try:
             Frp_file=open(Frp_filename,"r")
@@ -32,6 +34,7 @@ class Environment:
         
     
     def issubset(self,individual):
+        """Check if the individual is a subset of known_Area."""
         for idx in range(len(individual)+1):
             if individual[:idx] in self.known_Area:
                 return True
@@ -39,10 +42,12 @@ class Environment:
 
 
     def is_checked(self,individual):
+        """Check if the individual is checked or is FRP."""
         return individual in self.known_Area or self.isFRP(individual)
 
         
     def isFRP(self,individual):
+        """Check if the individual is in FRP_Area."""
         
         for idx in range(len(individual)+1):
             if individual[:idx] in self.FRP_Area:
@@ -50,10 +55,12 @@ class Environment:
         return False
     
     def add_FRP(self,individual):
+        """Add an individual to FRP_Area and known_Area."""
         self.FRP_Area.add(individual)
         self.known_Area.add(individual)
     
     def add_known_Area(self,individual):
+        """Add an individual to known_Area."""
         
         address,length=individual.split("/")
         length=int(length)
@@ -62,6 +69,7 @@ class Environment:
         self.known_Area.add(binary_representation[:length])
         
     def is_legal(self,individual):
+        """Check if the individual is legal."""
         if individual == None:
             return False
         else:

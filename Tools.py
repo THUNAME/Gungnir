@@ -28,23 +28,23 @@ def left_pad_sequences_inference(sequences, vocab):
     return torch.tensor(padded_sequences)
 
 def collate_fn(batch):
-    # 在每个样本开头添加START_TOKEN
+    # Add START_TOKEN at the beginning of each sample
     # vocab["START_TOKEN"]=2
     # vocab["PAD_TOKEN"]=5
     
-    device = batch[0].device  # 获取第一个样本的设备
+    device = batch[0].device  # Get the device of the first sample
     sequences = [torch.cat([
-        torch.tensor([2], device=device),  # 添加起始标记，并确保它在正确的设备上
-        sample.to(device)  # 将样本移动到正确的设备上
+        torch.tensor([2], device=device),  # Add start token and ensure it's on the correct device
+        sample.to(device)  # Move the sample to the correct device
     ]) for sample in batch]
     
     
-    # 左填充
-    reversed_seqs = [torch.flip(seq, [0]) for seq in sequences]  # 第一次反转
+    # Left padding
+    reversed_seqs = [torch.flip(seq, [0]) for seq in sequences]  # First reversal
     padded_reversed = pad_sequence(reversed_seqs, 
                                  batch_first=True, 
-                                 padding_value=5)  # 右侧填充反转后的序列
-    padded_sequences_left = torch.flip(padded_reversed, [1])  # 第二次反转
+                                 padding_value=5)  # Right padding for the reversed sequences
+    padded_sequences_left = torch.flip(padded_reversed, [1])  # Second reversal
     
     mask = (padded_sequences_left != 5).float()
     return padded_sequences_left, mask
@@ -62,10 +62,10 @@ def add_new_data_to_df(existing_df, new_data):
     Returns:
     - updated_df: The updated DataFrame.
     """
-    # 将新数据转换为DataFrame
+    # Convert new data to DataFrame
     new_df = pd.DataFrame(new_data)
     
-    # 将新数据添加到现有DataFrame
+    # Add new data to existing DataFrame
     updated_df = pd.concat([existing_df, new_df], ignore_index=True)
     
     return updated_df

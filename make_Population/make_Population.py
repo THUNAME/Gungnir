@@ -21,12 +21,13 @@ def add_new_data_to_df(existing_df, new_data):
     Returns:
     - updated_df: The updated DataFrame.
     """
-    # 将新数据转换为DataFrame
+    # Create a new DataFrame from the new data
     new_df = pd.DataFrame(new_data)
     
-    # 将新数据添加到现有DataFrame
+    # Concatenate the existing DataFrame and the new DataFrame
     updated_df = pd.concat([existing_df, new_df], ignore_index=True)
     
+    # Return the updated DataFrame
     return updated_df
 
 
@@ -70,7 +71,7 @@ def make_Population(seed_filename,config,active_type,header_type):
                 prefix_df=pd.DataFrame(prefix_data)
             
                 expanded_df = pd.concat([found.reset_index(drop=True), prefix_df], axis=1)
-                # 使用函数添加新数据到现有的DataFrame
+                
                 all_df = add_new_data_to_df(all_df, expanded_df)
 
 
@@ -79,18 +80,23 @@ def make_Population(seed_filename,config,active_type,header_type):
     
 
 def view_all_type(config):
-    
+    # List all files in the directory specified in the config
     all_filenames=os.listdir(config["seedfilefolder"])
     
   
+    # Iterate through each file in the directory
     for idx,all_filename in enumerate(all_filenames):
         
+        # Set header_type to True for the first file, otherwise False
         if idx == 0:
             header_type=True
         else:
             header_type=False
             
+        # Extract the active_type from the filename
         active_type=all_filename.split(".")[0]
+        
+        # Call make_Population function with the appropriate parameters
         make_Population(os.path.join(config["seedfilefolder"],all_filename),config,active_type,header_type=header_type)
     
 
@@ -99,7 +105,6 @@ if __name__ == '__main__':
     
     
     view_all_type(config)
-    # make_Population(config)
     pass
 
 

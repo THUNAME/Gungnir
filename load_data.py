@@ -44,28 +44,37 @@ def tokenize_test_data(untokenization_data,vocab):
 
 
 def untokenize_data(tokenization_data, vocab, logger, environment):
+    # Convert the tokenization data to a list and append the END_TOKEN from the vocabulary
     tokenization_data = list(tokenization_data)
     tokenization_data.append(str(vocab["END_TOKEN"]))
     
     try:
+        # Extract the binary number from the tokenization data up to the first occurrence of "3"
         bin_num = tokenization_data[:tokenization_data.index("3")]
+        # Get the length of the binary number, limited to 128 characters
         bin_length = min(len(bin_num), 128)
+        # Convert the binary number to a string
         bin_num = "".join(str(x) for x in bin_num)
         
+        # Check if the binary number is a subset of the environment or has been checked
         if environment.issubset(bin_num) or environment.is_checked(bin_num):
             return None, 0
         else:
+            # Add the binary number to the known_Area of the environment
             environment.known_Area.add(bin_num)
             
+        # Pad the binary number to 128 characters with "0"
         bin_num = bin_num[:128] + (128 - bin_length) * "0"
         
+        # Convert the binary number to a decimal number
         decimal_num = int(bin_num, 2)
-        # 再将十进制整数转换为十六进制字符串表示，使用格式化输出
+        # Convert the decimal number to a hexadecimal string
         hex_num = "{:X}".format(decimal_num)
 
         return hex_num, bin_length
     
     except Exception as e: 
+        # Log any exceptions that occur
         logger.error(f"An error occurred: {e}", exc_info=True)
         return None, 0
 

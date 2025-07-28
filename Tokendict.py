@@ -10,7 +10,7 @@ class Tokendict:
         
         self.vocab[0]=0
         self.vocab[1]=1
-        self.vocab["START_TOKEN"]=2 # 定义开始和结束token
+        self.vocab["START_TOKEN"]=2 # Define start and end tokens
         self.vocab["END_TOKEN"]=3
         self.vocab["UNSEED_TOKEN"]=4
         self.vocab["PAD_TOKEN"]=5
@@ -23,21 +23,21 @@ class Tokendict:
         
         with open(config["dataset"]) as data:
             csv_lists = []
-            reader = csv.reader(data)  # 直接使用文件对象
+            reader = csv.reader(data)  # Use file object directly
             
-            header = next(reader)  # 读取标题行
+            header = next(reader)  # Read header row
             for row in reader:
-                csv_lists.append(row)  # 去除token两边多余的引号和空格
+                csv_lists.append(row)  # Remove extra quotes and spaces around tokens
 
         # 0:as,1:org_name,2:category,3:sub_category,4:routing_prefix,5:prefix,6:active_type
-        # 合并列表
+        # Combine lists
         combined_list = []
         for csv_list in csv_lists:
             combined_list.extend([csv_list[i] for i in [0,1,2,3,6]])
             
         # combined_list = [x for sub_list in csv_list for x in sub_list[0,1,2,3,6]]
         
-        # 下一个可用的token_id，初始化为0
+        # Next available token_id, initialized to 0
         next_available_token_id = config["start_token_id"]
 
 
@@ -49,7 +49,7 @@ class Tokendict:
         return csv_lists
     
     def save_vocab(self,config):
-        # 可以选择也保存词表（比如保存为CSV文件方便查看和后续使用）
+        # Optionally save the vocabulary (e.g., save as a CSV file for easy viewing and future use)
         with open(config["vocab_save_path"], 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             for token, token_id in self.vocab.items():
