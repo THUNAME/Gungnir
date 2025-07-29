@@ -177,8 +177,8 @@ def main():
     config=dict(
         predict_path="/home/weichentian/quick_check/50TCP_443.txt",
         result_path="50TCP_443.txt",
-        passport="!@#weichentian$%^",
-        local_ipv6="2402:f000:6:1e00::232",
+        passport="passport",
+        local_ipv6="local_ipv6",
         generated_folder_path="scanningdata/generated_address",
         zmap_folder_path="scanningdata/zmap_result",
         
