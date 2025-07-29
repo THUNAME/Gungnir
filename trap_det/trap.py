@@ -205,8 +205,8 @@ def save_to_file(FRP_set):
 def main():
     config=dict(
         predict_path="/home/weichentian/quick_check/50ICMPv60.6.txt",
-        passport="!@#weichentian$%^",
-        local_ipv6="2402:f000:6:1e00::232",
+        passport="yourpassport",
+        local_ipv6="local_ipv6",
         generated_folder_path="scanningdata/generated_address",
         zmap_folder_path="scanningdata/zmap_result"
         
