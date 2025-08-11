@@ -33,14 +33,14 @@ Gungnir/
 ### 1. Generate Population Data
 Run the following command to generate Population_Gungnir.csv:
 ```bash
-python /home/weichentian/Gungnir/make_Population/make_Population.py
+python /make_Population/make_Population.py
 ```
 
 
 ### 2. Train the Model
 Run the following command to train the model:
 ```bash
-python /home/weichentian/Gungnir/train.py
+python train.py
 ```
 
 
@@ -48,7 +48,7 @@ python /home/weichentian/Gungnir/train.py
 ### 3. Execute Strategy
 Run the following command to execute the prediction strategy (ensure Prediction/Prediction.csv exists):
 ```bash
-python /home/weichentian/Gungnir/Strategy.py
+python Strategy.py
 ```
 
 
