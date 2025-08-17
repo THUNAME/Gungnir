@@ -9,6 +9,13 @@ This repo contains the official implementation of  [**"Gungnir: Autoregressive M
 ## Quick Start
 We propose **Gungnir**, *a multi-protocol unified FRP probing framework based on autoregressive semantic modeling*. **Gungnir** captures the intricate relationships between FRP patterns and their influencing factors through a deep semantic learning architecture. It leverages *prefix inference* and a *granularity correction mechanism* to accurately predict and validate FRPs while avoiding errors introduced by incorrect prefix length estimation.
 
+## Requirement
+Linux 5.15.0-130-generic #140~20.04.1-Ubuntu
+python 3.12.8
+NVIDIA GeForce RTX 4090
+
+
+
 ## File Structure
 ```
 Gungnir/
@@ -22,6 +29,7 @@ Gungnir/
 │   └── PredictionFRP.txt           # Prediction output file
 ├── train.py                        # Model training script
 └── Strategy.py                     # Strategy execution script
+└── requirements.txt                # pip requirements
 ```
 
 
