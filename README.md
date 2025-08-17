@@ -11,7 +11,9 @@ We propose **Gungnir**, *a multi-protocol unified FRP probing framework based on
 
 ## Requirement
 Linux 5.15.0-130-generic #140~20.04.1-Ubuntu
+
 python 3.12.8
+
 NVIDIA GeForce RTX 4090
 
 
