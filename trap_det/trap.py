@@ -69,10 +69,11 @@ def checkFrp(config,prefix_set):
         try:
             ipv6s=prefix_to_sixteen(prefix)
             Frp_dict[prefix]=ipv6s
+            
         except:
             # print(f"prefix {prefix} is invalid")
             pass
-    
+        
     # write ipv6 address to file
     for prefix,ipv6s in Frp_dict.items():
         for ipv6 in ipv6s:
@@ -164,7 +165,7 @@ def jump_outoftrap(prefix_dict,total_budget,config):
             # Calculate the new length after subtracting the trap length
             length-=trap_length
             # Form the new FRP prefix
-            frp=address+"/"+str(length)
+            frp=address+"/"+str(int(length))
             # Add the FRP prefix to the set
             prefix_set.add(frp)
             # Map the original prefix to its jump prefix
@@ -172,7 +173,8 @@ def jump_outoftrap(prefix_dict,total_budget,config):
         else:
             # Delete the prefix from the dictionary if trap length is less than 1
             del prefix_dict[prefix]
-
+            
+    print(prefix_set)
     # Check the FRP prefixes against the given configuration
     FRP_set = checkFrp(config, prefix_set)
     # Update the total budget by adding the number of prefixes in the set
@@ -198,15 +200,15 @@ def jump_outoftrap(prefix_dict,total_budget,config):
  
    
 def save_to_file(FRP_set):
-    with open("50ICMPv60.6.txt", 'a') as file:
+    with open("/home/weichentian/Gungnir/20251101ICMPv6_out.txt", 'a') as file:
             for line in FRP_set:
                 file.write(line + '\n') 
 
 def main():
     config=dict(
-        predict_path="/home/weichentian/quick_check/50ICMPv60.6.txt",
-        passport="yourpassport",
-        local_ipv6="local_ipv6",
+        predict_path="",
+        passport="",
+        local_ipv6="",
         generated_folder_path="scanningdata/generated_address",
         zmap_folder_path="scanningdata/zmap_result"
         
