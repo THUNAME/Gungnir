@@ -19,7 +19,7 @@ config=dict(
     
     vocab_save_path='vocab_Gungnir.csv',
     
-    routingprefix_file="data/routingprefix.txt",
+    routingprefix_file="data/latestv6.dat",
     num_genarate_FRP=50,
     num_models=1,
     
