@@ -1,245 +1,665 @@
 import ipaddress
-from itertools import islice
+import json
+import math
+import os
 import secrets
 import subprocess
+import argparse
+import tempfile
 import time
-import re
-from multiprocessing import Pool
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def startScaning(config):
-    
-    cmd = (f"sudo -S zmap -i eno1 --ipv6-source-ip={config['local_ipv6']} "
-            f"--ipv6-target-file={config['generated_address_path']} "
-            f"-o {config['zmap_result_path']} -M icmp6_echoscan -B 1M --verbosity=0")
-    echo = subprocess.Popen(['echo',config['passport']], stdout=subprocess.PIPE,)
-    p = subprocess.Popen(cmd, shell=True, stdin=echo.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    protocol = config.get('protocol', 'icmp')
+    port = config.get('port', 0)
+    metadata_path = config['zmap_result_path'] + ".metadata.json"
 
-    hit_rate = re.findall(r"\d+\.?\d*", p.communicate()[1][-10:].decode('utf-8'))[0]
-    print(f"Hit rate: {hit_rate}%")
-    return hit_rate
-        
+    cmd = [
+        "sudo", "-n", "zmap",
+        "-i", config.get('interface', 'eth0'),
+        f"--ipv6-source-ip={config['local_ipv6']}",
+        f"--ipv6-target-file={config['generated_address_path']}",
+        "-o", config['zmap_result_path'],
+        "--rate", str(config.get('rate', 10000)),
+        "--verbosity=0",
+        "--disable-syslog",
+        "--output-module=csv",
+        "--output-fields=saddr",
+        "--output-filter=success=1 && repeat=0",
+        f"--metadata-file={metadata_path}"
+    ]
+
+    if protocol == 'icmp':
+        cmd.extend(["-M", "icmp6_echoscan"])
+    elif protocol == 'tcp':
+        cmd.extend(["-M", "ipv6_tcp_synscan", "-p", str(port)])
+    elif protocol == 'udp' and port == 53:
+        cmd.extend([
+            "-M", "ipv6_dns", "-p", "53",
+            "--probe-args", f"name:{config['dns_domain']}"
+        ])
+    elif protocol == 'udp':
+        cmd.extend(["-M", "ipv6_udp", "-p", str(port)])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if proc.returncode != 0:
+            stderr_tail = proc.stderr[-4000:].strip()
+            raise RuntimeError(
+                f"zmap 扫描失败（rc={proc.returncode}）：{stderr_tail}"
+            )
+
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        hit_rate = metadata.get('hitrate')
+        if hit_rate is None:
+            raise RuntimeError("zmap metadata 中缺少 hitrate")
+
+        print(f"Hit rate: {hit_rate:.2f}%")
+        return hit_rate
+    finally:
+        try:
+            os.remove(metadata_path)
+        except FileNotFoundError:
+            pass
 
 
 def add_ipv6_colon(ipv6):
-    # add : to ipv6
-    ipv6_list = []
-    for i in range(0,len(ipv6),4):
-        ipv6_list.append(ipv6[i:i+4])
-    ipv6 = ":".join(ipv6_list)
-    return ipv6
-
+    return ":".join(ipv6[i:i+4] for i in range(0, len(ipv6), 4))
 
 
 def prefix_to_sixteen(prefix):
-    address,length=prefix.split("/")
-    length=int(length)
-    ipv6_object = ipaddress.IPv6Address(address)
-    binary_representation = format(int(ipv6_object), '0128b')
-    
-    ipv6s=[binary_representation[:length]]*min(2**(128-length),16)
-    need_complete_format="0"+str(min((128-length),4))+"b"
-    
-    if len(ipv6s)==1:
-        ipv6s[0]=hex(int(ipv6s[0], 2))[2:]
-        ipv6s[0]=add_ipv6_colon(ipv6s[0])
-        return ipv6s
+    address, length = prefix.rsplit("/", 1)
+    length = int(length)
+    network_int = int(ipaddress.IPv6Address(address)) & _PREFIX_MASKS[length]
+    host_bits = 128 - length
+    count = min(16, 1 << host_bits)
+
+    ipv6s = []
+    if host_bits >= 4:
+        for i in range(16):
+            value = network_int | (i << (host_bits - 4))
+            if host_bits > 4:
+                value |= secrets.randbits(host_bits - 4)
+            ipv6s.append(ipaddress.IPv6Address(value).exploded)
     else:
-        for i in range(len(ipv6s)):
-            
-            ipv6s[i]=ipv6s[i]+format(i, need_complete_format)+''.join([bin(secrets.randbelow(2))[2] for _ in range(128-length-4)])
-            # print(len(ipv6s[i]),ipv6s[i])
-            ipv6s[i] = hex(int(ipv6s[i], 2))[2:]
-            ipv6s[i]=add_ipv6_colon(ipv6s[i])
-        return ipv6s
+        # 小地址空间直接枚举，避免重复采样及 /128 的负随机位数。
+        for i in range(count):
+            ipv6s.append(ipaddress.IPv6Address(network_int + i).exploded)
+    return ipv6s
 
 
-def checkFrp(config,prefix_set):
-    
-    
-    config['generated_address_path']=config['generated_folder_path']+str(time.time())+'.txt'
-    config['zmap_result_path']=config['zmap_folder_path']+str(time.time())+'.txt'
-    
-    
-    file=open(config['generated_address_path'],'w')
-    Frp_dict=dict()
-
-    # generate ipv6 address for each prefix
-    for prefix in prefix_set:
-        try:
-            ipv6s=prefix_to_sixteen(prefix)
-            Frp_dict[prefix]=ipv6s
-            
-        except:
-            # print(f"prefix {prefix} is invalid")
-            pass
-        
-    # write ipv6 address to file
-    for prefix,ipv6s in Frp_dict.items():
-        for ipv6 in ipv6s:
-            file.write(ipv6+'\n')
-    file.close()
-
-    
-    # start scaning
-    hit_rate=startScaning(config)
-
-    active_address_set=set()
-    file=open(config['zmap_result_path'],'r')
-    for line in file:
-        ipv6_object=ipaddress.IPv6Address(line.strip())
-        active_address_set.add(str(ipv6_object.exploded))
-    file.close()
+def required_active_count(sample_count, threshold):
+    if not 0 < threshold <= 1:
+        raise ValueError("全响应阈值必须在 (0, 1] 范围内")
+    return max(1, math.ceil(sample_count * threshold))
 
 
-    FRP_set=set()
-    for prefix,ipv6s in Frp_dict.items():
-        flag=True
-        for ipv6 in ipv6s:
-            if ipv6 in active_address_set:
+def is_full_response(ipv6s, active, threshold):
+    active_count = sum(ip in active for ip in ipv6s)
+    return active_count >= required_active_count(len(ipv6s), threshold)
+
+
+def scan_single_prefix(config, prefix):
+    """每个前缀使用独立 ZMap 进程，确保其 --rate 只作用于当前前缀。"""
+    ipv6s = prefix_to_sixteen(prefix)
+    gen_tmp = tempfile.NamedTemporaryFile(
+        delete=False, dir=config['generated_folder_path'], suffix=".txt"
+    )
+    zmap_tmp = tempfile.NamedTemporaryFile(
+        delete=False, dir=config['zmap_folder_path'], suffix=".txt"
+    )
+    gen_tmp.close()
+    zmap_tmp.close()
+
+    local_config = config.copy()
+    local_config['generated_address_path'] = gen_tmp.name
+    local_config['zmap_result_path'] = zmap_tmp.name
+    local_config['rate'] = config['per_prefix_rate']
+
+    try:
+        with open(gen_tmp.name, 'w') as f:
+            for ip in ipv6s:
+                f.write(ip + "\n")
+
+        startScaning(local_config)
+        with open(zmap_tmp.name, 'r') as f:
+            active = {
+                str(ipaddress.IPv6Address(line.strip()).exploded)
+                for line in f if line.strip()
+            }
+        return is_full_response(
+            ipv6s, active, config.get('response_threshold', 1.0)
+        )
+    finally:
+        for path in (gen_tmp.name, zmap_tmp.name):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
                 pass
-            else:
-                flag=False
+
+
+def check_frp_per_prefix(config, prefix_set):
+    """以有界并发运行逐前缀扫描，最大聚合速率为 workers × per_prefix_rate。"""
+    prefixes = iter(prefix_set)
+    total = len(prefix_set)
+    workers = config['prefix_workers']
+    FRP_set = set()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = {}
+        for _ in range(workers):
+            try:
+                prefix = next(prefixes)
+            except StopIteration:
                 break
-        if flag:
-            FRP_set.add(prefix)
-            
-    print("to be checked FRP number:",len(prefix_set))
-    print("found FRP number:",len(FRP_set))
-    
+            pending[executor.submit(scan_single_prefix, config, prefix)] = prefix
+
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                prefix = pending.pop(future)
+                if future.result():
+                    FRP_set.add(prefix)
+                try:
+                    next_prefix = next(prefixes)
+                except StopIteration:
+                    continue
+                pending[
+                    executor.submit(scan_single_prefix, config, next_prefix)
+                ] = next_prefix
+
+    print("to be checked FRP number:", total)
+    print("found FRP number:", len(FRP_set))
     return FRP_set
 
 
-def split_set_into_chunks(original_set, num_chunks):
-    """
-    Splits the given set into the specified number of chunks.
-    
-    Args:
-        original_set (set): The set to be split.
-        num_chunks (int): The number of chunks to split the set into.
-    
-    Returns:
-        list: A list of sets, where each set is a chunk of the original set.
-    """
-    chunk_size = len(original_set) // num_chunks  # Calculate the size of each chunk
-    chunks = [set() for _ in range(num_chunks)]  # Initialize a list of empty sets for chunks
-    iterator = iter(original_set)  # Create an iterator for the original set
-    
-    for i in range(num_chunks):
-        chunks[i].update(islice(iterator, chunk_size))  # Distribute elements to each chunk
-    
-    for element in iterator:  # Handle any remaining elements
-        chunks[0].add(element)  # Add remaining elements to the first chunk
-    
-    return chunks  # Return the list of chunks
-
-    
+def _route_keys(config, prefix, address):
+    asn, bgp_prefix = config['bgp_db'].lookup(address)
+    bgp_key = bgp_prefix or f"unmatched-bgp:{prefix}"
+    as_key = asn if asn is not None else f"unmatched-as:{prefix}"
+    return bgp_key, as_key
 
 
+def _interleave_rate_groups(records):
+    """先交错 AS 内的 BGP，再交错各 AS，减少同组目标连续突发。"""
+    as_groups = {}
+    for record in records:
+        bgp_key, as_key = record[2], record[3]
+        as_groups.setdefault(as_key, {}).setdefault(bgp_key, []).append(record)
+
+    as_streams = []
+    for bgp_groups in as_groups.values():
+        streams = list(bgp_groups.values())
+        stream = []
+        for index in range(max(map(len, streams))):
+            for targets in streams:
+                if index < len(targets):
+                    stream.append(targets[index])
+        as_streams.append(stream)
+
+    interleaved = []
+    for index in range(max(map(len, as_streams))):
+        for stream in as_streams:
+            if index < len(stream):
+                interleaved.append(stream[index])
+    return interleaved
 
 
-def make_jump_prefix(line,jump_length=4):
-    address,length=line.split("/")
-    length=int(length)
-    length-=jump_length
-    frp=address+"/"+str(length)
-    return frp
+def _batch_window(config):
+    return max(
+        config['batch_targets'] / config['batch_rate'],
+        1 / config['bgp_rate'],
+        1 / config['as_rate'],
+    )
 
 
-def jump_outoftrap(prefix_dict,total_budget,config):
-    # Print the number of prefixes to be checked
-    print("to be checked ",len(prefix_dict))
-    
-    # Initialize an empty set to store the FRP prefixes
-    prefix_set=set()
-    # Initialize a dictionary to map original prefixes to their jump prefixes
-    prefix2jumpprefix=dict()
-    
-    # Iterate through the prefix dictionary
-    for prefix,trap_length in list(prefix_dict.items()):
-        # Check if the trap length is greater than or equal to 1
-        if trap_length>=1:
-            # Split the prefix into address and length
-            address,length=prefix.split("/")
-            length=int(length)
-            # Calculate the new length after subtracting the trap length
-            length-=trap_length
-            # Form the new FRP prefix
-            frp=address+"/"+str(int(length))
-            # Add the FRP prefix to the set
-            prefix_set.add(frp)
-            # Map the original prefix to its jump prefix
-            prefix2jumpprefix[prefix]=frp
+def scan_target_batch(config, records):
+    gen_tmp = tempfile.NamedTemporaryFile(
+        delete=False, dir=config['generated_folder_path'], suffix=".txt"
+    )
+    zmap_tmp = tempfile.NamedTemporaryFile(
+        delete=False, dir=config['zmap_folder_path'], suffix=".txt"
+    )
+    gen_tmp.close()
+    zmap_tmp.close()
+    local_config = config.copy()
+    local_config['generated_address_path'] = gen_tmp.name
+    local_config['zmap_result_path'] = zmap_tmp.name
+    # 稀疏批次同步降速，避免少量同组目标仍在全局高速率下形成突发。
+    paced_rate = max(1, int(len(records) / _batch_window(config)))
+    local_config['rate'] = min(config['batch_rate'], paced_rate)
+
+    try:
+        with open(gen_tmp.name, 'w') as f:
+            for _, address, _, _ in records:
+                f.write(address + "\n")
+        startScaning(local_config)
+        with open(zmap_tmp.name, 'r') as f:
+            return {
+                ipaddress.IPv6Address(line.strip()).exploded
+                for line in f if line.strip()
+            }
+    finally:
+        for path in (gen_tmp.name, zmap_tmp.name):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
+def _take_rate_limited_batch(config, states, queue):
+    batch_targets = config['batch_targets']
+    window = _batch_window(config)
+    bgp_quota = max(1, int(config['bgp_rate'] * window))
+    as_quota = max(1, int(config['as_rate'] * window))
+    bgp_counts = {}
+    as_counts = {}
+    records = []
+    deferred = []
+
+    while queue and len(records) < batch_targets:
+        prefix = queue.popleft()
+        state = states[prefix]
+        address = state['samples'][state['sent']]
+        bgp_key, as_key = _route_keys(config, prefix, address)
+        if (
+            bgp_counts.get(bgp_key, 0) >= bgp_quota
+            or as_counts.get(as_key, 0) >= as_quota
+        ):
+            deferred.append(prefix)
+            continue
+
+        bgp_counts[bgp_key] = bgp_counts.get(bgp_key, 0) + 1
+        as_counts[as_key] = as_counts.get(as_key, 0) + 1
+        state['sent'] += 1
+        records.append((prefix, address, bgp_key, as_key))
+
+    queue.extendleft(reversed(deferred))
+    return _interleave_rate_groups(records) if records else []
+
+
+def check_frp_batch(config, prefix_set):
+    """分层配额批量扫描，并按 75% 等阈值的可达结论提前停止。"""
+    states = {}
+    threshold = config.get('response_threshold', 1.0)
+    for prefix in sorted(prefix_set):
+        samples = prefix_to_sixteen(prefix)
+        states[prefix] = {
+            'samples': samples,
+            'sent': 0,
+            'hits': 0,
+            'required': required_active_count(len(samples), threshold),
+        }
+
+    queue = deque(states)
+    frp_set = set()
+    early_accept = 0
+    early_reject = 0
+    batches = 0
+    total_probes = 0
+    window = _batch_window(config)
+
+    while queue:
+        records = _take_rate_limited_batch(config, states, queue)
+        if not records:
+            raise RuntimeError("批量调度器未能生成目标，状态机无法继续")
+        batch_started = time.monotonic()
+        active = scan_target_batch(config, records)
+        batches += 1
+        total_probes += len(records)
+
+        scheduled = set()
+        for prefix, address, _, _ in records:
+            scheduled.add(prefix)
+            if address in active:
+                states[prefix]['hits'] += 1
+
+        for prefix in scheduled:
+            state = states[prefix]
+            total = len(state['samples'])
+            remaining = total - state['sent']
+            complete = state['sent'] == total
+            enough = state['hits'] >= state['required']
+            impossible = state['hits'] + remaining < state['required']
+            if config['early_stop'] and enough:
+                frp_set.add(prefix)
+                early_accept += 1
+            elif config['early_stop'] and impossible:
+                early_reject += 1
+            elif complete:
+                if enough:
+                    frp_set.add(prefix)
+            else:
+                queue.append(prefix)
+
+        elapsed = time.monotonic() - batch_started
+        if elapsed < window:
+            time.sleep(window - elapsed)
+
+    print(
+        f"Batch scan: batches={batches}; probes={total_probes}; "
+        f"early_accept={early_accept}; early_reject={early_reject}; "
+        f"FRP={len(frp_set)}"
+    )
+    return frp_set
+
+
+def checkFrp(config, prefix_set):
+    if not prefix_set:
+        raise ValueError("没有可扫描的前缀")
+    if config.get('per_prefix_rate') is not None:
+        return check_frp_per_prefix(config, prefix_set)
+    if config.get('batch_rate'):
+        return check_frp_batch(config, prefix_set)
+
+    # 每次生成两条新的临时文件路径 —— 始终覆盖旧的，不删除 config 的 key
+    gen_tmp = tempfile.NamedTemporaryFile(delete=False, dir=config['generated_folder_path'], suffix=".txt")
+    zmap_tmp = tempfile.NamedTemporaryFile(delete=False, dir=config['zmap_folder_path'], suffix=".txt")
+
+    gen_tmp.close()
+    zmap_tmp.close()
+
+    # 永远写回 key，确保一定存在
+    config['generated_address_path'] = gen_tmp.name
+    config['zmap_result_path'] = zmap_tmp.name
+
+    Frp_dict = {}
+    for prefix in prefix_set:
+        try:
+            Frp_dict[prefix] = prefix_to_sixteen(prefix)
+        except Exception as exc:
+            raise ValueError(f"无法为前缀 {prefix} 生成扫描地址：{exc}") from exc
+
+    # 写入目标地址文件
+    with open(config['generated_address_path'], 'w') as f:
+        for ipv6s in Frp_dict.values():
+            for ip in ipv6s:
+                f.write(ip + "\n")
+
+    startScaning(config)
+
+    # 读取 zmap 输出
+    active = set()
+    with open(config['zmap_result_path'], 'r') as f:
+        for line in f:
+            active.add(str(ipaddress.IPv6Address(line.strip()).exploded))
+
+    # 计算 FRP
+    threshold = config.get('response_threshold', 1.0)
+    FRP_set = {
+        prefix for prefix, ipv6s in Frp_dict.items()
+        if is_full_response(ipv6s, active, threshold)
+    }
+
+    print("to be checked FRP number:", len(prefix_set))
+    print("found FRP number:", len(FRP_set))
+
+    # -----------------------------
+    # 🔥 删除临时文件（只删除文件，不删除 config key）
+    # -----------------------------
+    try:
+        os.remove(config['generated_address_path'])
+    except FileNotFoundError:
+        pass
+
+    try:
+        os.remove(config['zmap_result_path'])
+    except FileNotFoundError:
+        pass
+
+    return FRP_set
+
+
+def save_to_file(FRP_set, config):
+    with open(config['outputfrp'], 'a') as f:
+        for line in FRP_set:
+            f.write(line + "\n")
+
+
+_PREFIX_MASKS = tuple(
+    ((1 << length) - 1) << (128 - length) for length in range(129)
+)
+
+
+def make_jump_prefix(prefix, trap_len):
+    """用整数掩码直接生成规范父网，避免逐分支构造 IPv6Network。"""
+    if not isinstance(trap_len, int):
+        raise TypeError(f"前缀 {prefix} 的跳转步长不是整数：{trap_len!r}")
+    if trap_len < 1:
+        raise ValueError(f"前缀 {prefix} 的跳转步长必须为正数")
+
+    addr, length = prefix.rsplit("/", 1)
+    new_len = int(length) - trap_len
+    if not 0 <= new_len <= 128:
+        raise ValueError(f"前缀 {prefix} 跳转后长度无效：{new_len}")
+
+    network_int = int(ipaddress.IPv6Address(addr)) & _PREFIX_MASKS[new_len]
+    return f"{ipaddress.IPv6Address(network_int)}/{new_len}"
+
+
+def jump_outoftrap(prefix_dict, total_budget, config):
+    print("to be checked ", len(prefix_dict))
+
+    # 同一规范父网只扫描一次，同时保留全部来源分支用于独立回退。
+    jump_groups = {}
+    source_count = 0
+    for prefix, trap_len in prefix_dict.items():
+        if trap_len < 1:
+            continue
+        jump = make_jump_prefix(prefix, trap_len)
+        jump_groups.setdefault(jump, []).append(prefix)
+        source_count += 1
+
+    if not jump_groups:
+        return total_budget, {}
+
+    print(
+        "canonical parent groups:", len(jump_groups),
+        "merged branches:", source_count - len(jump_groups)
+    )
+    FRP_set = checkFrp(config, jump_groups.keys())
+    total_budget += len(jump_groups)
+    save_to_file(FRP_set, config)
+
+    next_prefix_dict = {}
+
+    def retain_state(prefix, trap_len):
+        if trap_len < 1:
+            return
+        previous = next_prefix_dict.get(prefix)
+        next_prefix_dict[prefix] = (
+            trap_len if previous is None else min(previous, trap_len)
+        )
+
+    for jump, sources in jump_groups.items():
+        if jump in FRP_set:
+            # 多分支收敛时采用最保守步长，避免跳过尚未验证的中间前缀。
+            retain_state(jump, min(prefix_dict[source] for source in sources))
         else:
-            # Delete the prefix from the dictionary if trap length is less than 1
-            del prefix_dict[prefix]
-            
-    print(prefix_set)
-    # Check the FRP prefixes against the given configuration
-    FRP_set = checkFrp(config, prefix_set)
-    # Update the total budget by adding the number of prefixes in the set
-    total_budget+=len(prefix_set)
-    # Save the FRP set to a file
-    save_to_file(FRP_set)
-    
-    # Iterate through the mapping of original prefixes to jump prefixes
-    for prefix,jumpprefix in list(prefix2jumpprefix.items()):
-        # Check if the jump prefix is in the FRP set
-        if jumpprefix in FRP_set:
-            # Update the prefix dictionary with the jump prefix
-            prefix_dict[jumpprefix]=prefix_dict[prefix]
-            # Delete the original prefix from the dictionary
-            del prefix_dict[prefix]
-        else:
-            # Halve the trap length for the original prefix if its jump prefix is not in the FRP set
-            prefix_dict[prefix]/=2
-            
-    
-    # Return the updated total budget and prefix dictionary
-    return total_budget,prefix_dict
- 
-   
-def save_to_file(FRP_set):
-    with open("/home/weichentian/Gungnir/20251101ICMPv6_out.txt", 'a') as file:
-            for line in FRP_set:
-                file.write(line + '\n') 
+            for source in sources:
+                retain_state(source, prefix_dict[source] // 2)
+
+    return total_budget, next_prefix_dict
+
+
+def initialize_prefix_states(predict_path, bgp_db, fallback_jump=8):
+    """按目标长度与最长匹配 BGP 前缀长度之差初始化跳转步长。"""
+    if not isinstance(fallback_jump, int) or not 1 <= fallback_jump <= 128:
+        raise ValueError("回退跳转步长必须在 1..128 范围内")
+
+    prefix_dict = {}
+    stats = {'dynamic': 0, 'unmatched': 0, 'nonpositive': 0}
+    with open(predict_path, 'r') as f:
+        for line_number, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                network = ipaddress.ip_network(line, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"{predict_path}:{line_number} 不是合法前缀：{line}") from exc
+            if network.version != 6:
+                raise ValueError(f"仅支持 IPv6 前缀：{line}")
+
+            _, bgp_prefix = bgp_db.lookup(str(network.network_address))
+            delta = 0
+            if bgp_prefix is None:
+                stats['unmatched'] += 1
+            else:
+                try:
+                    bgp_len = int(bgp_prefix.rsplit('/', 1)[1])
+                except (AttributeError, IndexError, ValueError) as exc:
+                    raise ValueError(
+                        f"BGP 查询返回非法前缀 {bgp_prefix!r}，目标为 {network}"
+                    ) from exc
+                if not 0 <= bgp_len <= 128:
+                    raise ValueError(f"BGP 前缀长度无效 {bgp_prefix!r}，目标为 {network}")
+                delta = network.prefixlen - bgp_len
+                if delta <= 0:
+                    stats['nonpositive'] += 1
+
+            if delta > 0:
+                prefix_dict[str(network)] = delta
+                stats['dynamic'] += 1
+            else:
+                prefix_dict[str(network)] = fallback_jump
+
+    if not prefix_dict:
+        raise ValueError("输入文件没有有效的 IPv6 前缀")
+    return prefix_dict, stats
+
 
 def main():
-    config=dict(
-        predict_path="",
-        passport="",
-        local_ipv6="",
-        generated_folder_path="scanningdata/generated_address",
-        zmap_folder_path="scanningdata/zmap_result"
-        
+    parser = argparse.ArgumentParser(description="FRP IPv6 Prefix Checker")
+
+    parser.add_argument("--predict_path", type=str, required=True)
+    parser.add_argument(
+        "--bgp-dat", default=os.path.join(PROJECT_ROOT, "data", "latestv6.dat"),
+        help="pyasn IPv6 BGP 数据库，用于计算动态初始跳转步长"
     )
-    
-    # read prefix from file
-    prefix_dict=dict()
-    file=open(config['predict_path'],'r')
-    for line in file:
-        prefix_dict[line.strip()]=8
-    file.close()
-    
-    
-    # start jumping
-    total_budget=0
-    while True:
-        total_budget,prefix_dict=jump_outoftrap(prefix_dict,total_budget,config)
-        
-        if len(prefix_dict)==0:
-            break
-        
-    print("total buget:",total_budget)
+    # 兼容尚未退出的旧编排进程；参数不再读取或用于 sudo。
+    parser.add_argument("--passport", dest="legacy_passport", help=argparse.SUPPRESS)
+    parser.add_argument("--local_ipv6", type=str, required=True)
+    parser.add_argument("--generated_folder", type=str, required=True)
+    parser.add_argument("--zmap_folder", type=str, required=True)
+    parser.add_argument("--outputfrp", type=str, required=True)
+    parser.add_argument("--protocol", type=str, default="icmp", choices=["icmp", "tcp", "udp"])
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--rate", type=int, default=10000, help="ZMap 发送速率，单位 pps")
+    parser.add_argument("--response-threshold", type=float, default=1.0, help="全响应判定阈值，默认 1.0")
+    parser.add_argument("--per-prefix-rate", type=int, help="每个前缀独立的 ZMap pps")
+    parser.add_argument("--prefix-workers", type=int, default=4, help="逐前缀扫描的最大并发数")
+    parser.add_argument(
+        "--batch-rate", type=int, default=5000,
+        help="批量模式的全局最高 ZMap pps；设为 0 可禁用批量模式"
+    )
+    parser.add_argument("--bgp-rate", type=float, default=10, help="批量模式每 BGP 时间窗平均 pps")
+    parser.add_argument("--as-rate", type=float, default=50, help="批量模式每 AS 时间窗平均 pps")
+    parser.add_argument("--batch-targets", type=int, default=20000, help="每批最大目标地址数")
+    parser.add_argument(
+        "--no-early-stop", action="store_true",
+        help="批量模式发送全部样本，不在结论已确定时提前停止"
+    )
+    parser.add_argument("--interface", default="eth0")
+    parser.add_argument("--dns-domain", default="example.com", help="UDP/53 DNS 查询域名")
+
+    args = parser.parse_args()
+    if args.protocol in ("tcp", "udp") and not 1 <= args.port <= 65535:
+        parser.error("TCP/UDP 扫描必须指定 1..65535 的目标端口")
+    if args.rate <= 0:
+        parser.error("--rate 必须是正整数")
+    if not 0 < args.response_threshold <= 1:
+        parser.error("--response-threshold 必须在 (0, 1] 范围内")
+    if args.per_prefix_rate is not None and args.per_prefix_rate <= 0:
+        parser.error("--per-prefix-rate 必须是正整数")
+    if args.prefix_workers <= 0:
+        parser.error("--prefix-workers 必须是正整数")
+    if args.batch_rate is not None and args.batch_rate < 0:
+        parser.error("--batch-rate 必须是非负整数")
+    if args.batch_rate and args.per_prefix_rate is not None:
+        parser.error("--batch-rate 与 --per-prefix-rate 不能同时使用；逐前缀模式请设 --batch-rate 0")
+    if (
+        not math.isfinite(args.bgp_rate) or not math.isfinite(args.as_rate)
+        or args.bgp_rate <= 0 or args.as_rate <= 0
+    ):
+        parser.error("--bgp-rate 与 --as-rate 必须是有限的正数")
+    if args.batch_targets <= 0:
+        parser.error("--batch-targets 必须是正整数")
+    if not args.dns_domain:
+        parser.error("--dns-domain 不能为空")
+    ipaddress.IPv6Address(args.local_ipv6)
+
+    config = dict(
+        predict_path=args.predict_path,
+        local_ipv6=args.local_ipv6,
+        generated_folder_path=args.generated_folder if args.generated_folder.endswith("/") else args.generated_folder + "/",
+        zmap_folder_path=args.zmap_folder if args.zmap_folder.endswith("/") else args.zmap_folder + "/",
+        outputfrp=args.outputfrp,
+        protocol=args.protocol,
+        port=args.port,
+        rate=args.rate,
+        response_threshold=args.response_threshold,
+        per_prefix_rate=args.per_prefix_rate,
+        prefix_workers=args.prefix_workers,
+        batch_rate=args.batch_rate,
+        bgp_rate=args.bgp_rate,
+        as_rate=args.as_rate,
+        batch_targets=args.batch_targets,
+        early_stop=not args.no_early_stop,
+        interface=args.interface,
+        dns_domain=args.dns_domain
+    )
+    os.makedirs(config['generated_folder_path'], exist_ok=True)
+    os.makedirs(config['zmap_folder_path'], exist_ok=True)
+    print(f"Response threshold: {args.response_threshold:.2%}")
+    if args.per_prefix_rate is not None:
+        print(
+            f"Per-prefix rate: {args.per_prefix_rate} pps; "
+            f"workers: {args.prefix_workers}; "
+            f"max aggregate rate: {args.per_prefix_rate * args.prefix_workers} pps"
+        )
+
+    try:
+        import pyasn
+    except ImportError as exc:
+        raise RuntimeError("动态初始步长需要 pyasn，请在 Gungnir 的 wct 环境中运行") from exc
+
+    bgp_db = pyasn.pyasn(args.bgp_dat)
+    config['bgp_db'] = bgp_db
+    prefix_dict, jump_stats = initialize_prefix_states(config['predict_path'], bgp_db)
+    print(
+        f"Initial jump: dynamic={jump_stats['dynamic']}; "
+        f"fallback-unmatched={jump_stats['unmatched']}; "
+        f"fallback-nonpositive={jump_stats['nonpositive']}; fallback-step=8"
+    )
+    if args.batch_rate:
+        window = max(
+            args.batch_targets / args.batch_rate,
+            1 / args.bgp_rate,
+            1 / args.as_rate,
+        )
+        print(
+            f"Batch rate: global={args.batch_rate} pps; BGP={args.bgp_rate} pps; "
+            f"AS={args.as_rate} pps; window={window:.3f}s; "
+            f"early_stop={not args.no_early_stop}"
+        )
+
+    total_budget = 0
+    while prefix_dict:
+        total_budget, prefix_dict = jump_outoftrap(prefix_dict, total_budget, config)
+
+    print("total buget:", total_budget)
 
 
-
-
-    
-    
 if __name__ == "__main__":
     main()
-    
-    
-    
-    

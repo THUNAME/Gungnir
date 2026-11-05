@@ -64,7 +64,7 @@ python Strategy.py
 
 ### 4. Adaptive Threshold Probing (Optional)
 
-`adaptive_probe.py` provides an optional `checkFrp` implementation with adaptive branch pruning and a decoupled address-generation/scanning pipeline. The original `trap_det/trap.py` and `trap_det/trap_tcp.py` entry points are unchanged.
+`adaptive_probe.py` provides an optional single-round `checkFrp` implementation with adaptive branch pruning and a decoupled address-generation/scanning pipeline. For BGP-guided multi-round granularity correction, use `trap_det/trap.py` as described below.
 
 The pipeline consists of two components:
 
@@ -114,6 +114,49 @@ frp_set = checkFrp(
 ```
 
 Calling `checkFrp(config, prefixes)` uses `response_threshold=0.75` and `scan_rate_bps=100`. Temporary target and result files are written below the two configured output directories.
+
+
+### 5. BGP-Guided Multi-Round Probing
+
+`trap_det/trap.py` performs multi-round granularity correction with canonical parent grouping, adaptive early stopping, and hierarchical batch rate limits. It is independent of the single-round `adaptive_probe.py` implementation.
+
+The algorithm works as follows:
+
+1. Load the pyasn database once and find the longest matching BGP prefix for each input prefix. The initial jump is `target_prefix_length - bgp_prefix_length` when positive; otherwise, or when no route matches, it falls back to 8.
+2. Generate candidate parents with integer 128-bit masks. All branches that resolve to the same canonical parent share one probe in that round.
+3. Generate up to 16 addresses per parent using integer sampling. Smaller address spaces are enumerated completely.
+4. Classify a parent using `ceil(sample_count * response_threshold)` unique responses. At a threshold of 0.75, 12 responses accept a 16-sample parent and five missing responses reject it early; undecided parents continue to at most 16 probes.
+5. Move to a responsive parent while keeping the current jump. After an unsuccessful probe, keep the current prefix and halve the jump using integer division. Multiple converging branches retain the most conservative jump.
+
+The batch scheduler defaults to a global maximum of 5000 packets/s, 10 packets/s per BGP prefix, 50 packets/s per AS, and 20000 addresses per batch. The default window is therefore four seconds. Each batch invokes one ZMap process and pays its cooldown once. Sparse batches are paced at a lower rate, and BGP/AS groups are interleaved in the target file. These are batch-window average limits, not a per-packet kernel token bucket.
+
+```bash
+python trap_det/trap.py \
+    --predict_path /path/to/authorized-prefixes.txt \
+    --bgp-dat data/latestv6.dat \
+    --local_ipv6 '<your-source-ipv6>' \
+    --generated_folder /tmp/gungnir/generated \
+    --zmap_folder /tmp/gungnir/results \
+    --outputfrp /tmp/gungnir/confirmed.txt \
+    --protocol icmp \
+    --response-threshold 0.75 \
+    --batch-rate 5000 \
+    --bgp-rate 10 \
+    --as-rate 50 \
+    --batch-targets 20000
+```
+
+`--no-early-stop` sends all 16 samples. Set `--batch-rate 0` to disable the new batch scheduler; the legacy single-batch path and the independent per-prefix mode remain available. When using `--per-prefix-rate`, also set `--batch-rate 0`.
+
+ZMap is invoked with `sudo -n`, so non-interactive privilege must be configured in advance. UDP/53 uses the `ipv6_dns` module and `--dns-domain`. Any nonzero ZMap status or missing metadata aborts the scan rather than being treated as an empty result. Only probe networks that you are authorized to measure.
+
+To discard prefixes already covered by a shorter input prefix without merging adjacent siblings, use:
+
+```bash
+python tools/select_shortest_prefixes.py \
+    --input /path/to/prefixes.txt \
+    --output /path/to/prefixes-shortest.txt
+```
 
 
 ## Acknowledgement
