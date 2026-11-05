@@ -116,19 +116,31 @@ frp_set = checkFrp(
 Calling `checkFrp(config, prefixes)` uses `response_threshold=0.75` and `scan_rate_bps=100`. Temporary target and result files are written below the two configured output directories.
 
 
-### 5. BGP-Guided Multi-Round Probing
+### 5. Online Scanning and Granularity Correction
 
-`trap_det/trap.py` performs multi-round granularity correction with canonical parent grouping, adaptive early stopping, and hierarchical batch rate limits. It is independent of the single-round `adaptive_probe.py` implementation.
+The ICNP 2025 paper describes a three-stage pipeline: semantic learning, prefix inference, and online scanning. `trap_det/trap.py` implements the online scanning stage; `adaptive_probe.py` is a separate single-round alternative and is not part of the multi-round correction loop described below.
 
-The algorithm works as follows:
+#### Paper baseline (Section IV-D)
 
-1. Load the pyasn database once and find the longest matching BGP prefix for each input prefix. The initial jump is `target_prefix_length - bgp_prefix_length` when positive; otherwise, or when no route matches, it falls back to 8.
-2. Generate candidate parents with integer 128-bit masks. All branches that resolve to the same canonical parent share one probe in that round.
-3. Generate up to 16 addresses per parent using integer sampling. Smaller address spaces are enumerated completely.
-4. Classify a parent using `ceil(sample_count * response_threshold)` unique responses. At a threshold of 0.75, 12 responses accept a 16-sample parent and five missing responses reject it early; undecided parents continue to at most 16 probes.
-5. Move to a responsive parent while keeping the current jump. After an unsuccessful probe, keep the current prefix and halve the jump using integer division. Multiple converging branches retain the most conservative jump.
+The paper divides online scanning into two operations:
 
-The batch scheduler defaults to a global maximum of 5000 packets/s, 10 packets/s per BGP prefix, 50 packets/s per AS, and 20000 addresses per batch. The default window is therefore four seconds. Each batch invokes one ZMap process and pays its cooldown once. Sparse batches are paced at a lower rate, and BGP/AS groups are interleaved in the target file. These are batch-window average limits, not a per-packet kernel token bucket.
+1. **FRP confirmation.** Probe 16 randomly selected addresses, one under each of the `0-f` child prefixes when the address space permits. Confirm the candidate as an FRP only when all 16 addresses respond. The evaluation uses the same 16/16 rule, and one probing budget represents 16 addresses within one prefix.
+2. **Granularity correction.** Starting from an initial correction length `lc`, progressively probe shorter prefixes and decay `lc` by half in successive rounds. The purpose is to correct prefix-length errors in existing FRP datasets rather than to infer unverified parents by aggregation alone.
+
+The paper does not prescribe a formula for choosing the initial `lc`, and it does not use a 75% acceptance threshold.
+
+#### Repository implementation and engineering extensions
+
+The current implementation follows the paper's confirmation-and-correction objective, with the following concrete state machine and scalability extensions:
+
+- **Initial correction length (`lc`):** the dynamic initial jump is the initial correction length `lc` used by granularity correction. Concretely, set `lc = target_prefix_length - bgp_prefix_length` when positive, based on the longest pyasn BGP match; use 8 when the difference is non-positive or no route matches. The paper leaves the initial value open, and this formula is the repository's concrete instantiation.
+- **Canonical parent grouping:** compute parents with integer 128-bit masks. Branches resolving to the same canonical parent are measured once per round, while their source state is retained independently.
+- **State transition:** move to a responsive parent while retaining the current correction length. After an unsuccessful probe, retain the current prefix and halve the correction length with integer division. Converging branches retain the smallest correction length.
+- **Integer address generation:** generate up to 16 addresses with the same `0-f` child-prefix structure. Prefixes with fewer than 16 available addresses are enumerated completely.
+- **Configurable response threshold and early stopping:** the baseline is 16/16 (`response_threshold=1.0`). The threshold can be configured when a different acceptance ratio is desired, using `ceil(sample_count * response_threshold)` responses. For example, 0.75 requires 12 responses and permits rejection after five missing responses. Early stopping avoids sending probes that can no longer change the selected threshold's decision.
+- **Hierarchical rate control:** limit the global, per-BGP, and per-AS batch-window rates, interleave targets, and reduce the rate of sparse batches. This is operational pacing rather than a claim made by the paper.
+
+To reproduce the paper's 16/16 acceptance rule and its full 16-address probing behavior, set `response_threshold=1.0` and disable early stopping:
 
 ```bash
 python trap_det/trap.py \
@@ -139,14 +151,19 @@ python trap_det/trap.py \
     --zmap_folder /tmp/gungnir/results \
     --outputfrp /tmp/gungnir/confirmed.txt \
     --protocol icmp \
-    --response-threshold 0.75 \
+    --response-threshold 1.0 \
+    --no-early-stop \
     --batch-rate 5000 \
     --bgp-rate 10 \
     --as-rate 50 \
     --batch-targets 20000
 ```
 
-`--no-early-stop` sends all 16 samples. Set `--batch-rate 0` to disable the new batch scheduler; the legacy single-batch path and the independent per-prefix mode remain available. When using `--per-prefix-rate`, also set `--batch-rate 0`.
+For the optional 75% mode, use `--response-threshold 0.75` and omit `--no-early-stop`. At threshold 1.0, early stopping after the first missing address is logically equivalent to the 16/16 decision, but it changes the number of probes and should be disabled when comparing against the paper's budget accounting.
+
+The batch scheduler defaults to a global maximum of 5000 packets/s, 10 packets/s per BGP prefix, 50 packets/s per AS, and 20000 addresses per batch. The default window is four seconds. Each batch invokes one ZMap process and pays its cooldown once. These are batch-window average limits, not a per-packet kernel token bucket.
+
+Set `--batch-rate 0` to disable the new batch scheduler. The legacy single-batch path and independent per-prefix mode remain available; when using `--per-prefix-rate`, also set `--batch-rate 0`.
 
 ZMap is invoked with `sudo -n`, so non-interactive privilege must be configured in advance. UDP/53 uses the `ipv6_dns` module and `--dns-domain`. Any nonzero ZMap status or missing metadata aborts the scan rather than being treated as an empty result. Only probe networks that you are authorized to measure.
 
