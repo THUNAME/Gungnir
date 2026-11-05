@@ -1,7 +1,7 @@
 """自适应阈值 FRP 探测。
 
 本模块不修改 trap.py / trap_tcp.py。AddressProducer 只负责生成地址文件，
-ZMapConsumer 只负责调用 ZMapv6 并读取响应，AdaptiveFrpPipeline 负责逐层调度。
+ZMapConsumer 只负责调用 ZMapv6 并读取响应，AdaptiveFrpPipeline 负责单轮阈值判定。
 """
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ except ImportError:  # 支持作为 Gungnir 包导入
 
 DEFAULT_RESPONSE_THRESHOLD = 0.75
 DEFAULT_SCAN_RATE_PPS = 100
-MAX_LAYER = 15
 
 
 @dataclass(frozen=True)
@@ -85,30 +84,6 @@ def _generate_addresses(prefix: str) -> tuple[str, ...]:
             str(ipaddress.IPv6Address(int(network.network_address) | suffix))
         )
     return tuple(addresses)
-
-
-def _child_prefixes(prefix: str, addresses: tuple[str, ...]) -> tuple[str, ...]:
-    """将本层的 16 个地址映射为下一层的 16 个子前缀。"""
-    network = ipaddress.IPv6Network(prefix, strict=False)
-    child_length = network.prefixlen + 4
-    if child_length > 128:
-        return ()
-
-    mask = ((1 << child_length) - 1) << (128 - child_length)
-    children = {
-        str(
-            ipaddress.IPv6Network(
-                (int(ipaddress.IPv6Address(address)) & mask, child_length)
-            )
-        )
-        for address in addresses
-    }
-    return tuple(
-        sorted(
-            children,
-            key=lambda item: int(ipaddress.IPv6Network(item).network_address),
-        )
-    )
 
 
 class AddressProducer:
@@ -223,7 +198,7 @@ class ZMapConsumer:
 
 
 class AdaptiveFrpPipeline:
-    """按层执行 Producer -> Consumer -> 阈值剪枝。"""
+    """执行单轮 Producer -> Consumer -> 阈值判定，不扩展任何子前缀。"""
 
     def __init__(
         self,
@@ -265,55 +240,31 @@ class AdaptiveFrpPipeline:
             print("found FRP number: 0")
             return set()
 
-        active = [Branch(root=root, prefix=root) for root in roots]
+        branches = [Branch(root=root, prefix=root) for root in roots]
+        batch = self.producer.produce(branches, depth=0)
+        active_addresses = self.consumer.scan(batch)
         frp_set: set[str] = set()
 
-        for depth in range(MAX_LAYER + 1):
-            if not active:
-                break
+        for unit in batch.units:
+            addresses = unit.addresses
+            response_count = sum(address in active_addresses for address in addresses)
+            address_count = len(addresses)
+            response_rate = response_count / address_count
+            meets_threshold = response_rate >= self.response_threshold
 
-            batch = self.producer.produce(active, depth)
-            active_addresses = self.consumer.scan(batch)
-            next_active: list[Branch] = []
+            if meets_threshold:
+                frp_set.add(unit.branch.root)
 
-            for unit in batch.units:
-                addresses = unit.addresses
-                response_count = sum(
-                    address in active_addresses for address in addresses
-                )
-                address_count = len(addresses)
-                response_rate = response_count / address_count
-                meets_threshold = response_rate >= self.response_threshold
-                all_responded = response_count == address_count
-                full_sixteen = address_count == 16 and response_count == 16
-
-                # 默认返回口径保持原 checkFrp：输入前缀首层全部地址响应才是 FRP。
-                if depth == 0 and all_responded:
-                    frp_set.add(unit.branch.root)
-
-                # 达到阈值但不足 16/16 时停止；只有 16/16 才向下一层扩展。
-                expand = meets_threshold and full_sixteen and depth < MAX_LAYER
-                pruned = not meets_threshold
-                print(
-                    f"layer: {depth}, subprefix: {unit.branch.prefix}, "
-                    f"to be checked address number: {address_count}"
-                )
-                print(
-                    f"layer: {depth}, subprefix: {unit.branch.prefix}, "
-                    f"found address number: {response_count}, "
-                    f"response rate: {response_rate:.2%}, "
-                    f"continue expansion: {'yes' if expand else 'no'}, "
-                    f"pruned: {'yes' if pruned else 'no'}"
-                )
-
-                if expand:
-                    children = _child_prefixes(unit.branch.prefix, addresses)
-                    next_active.extend(
-                        Branch(root=unit.branch.root, prefix=child)
-                        for child in children
-                    )
-
-            active = next_active
+            print(
+                f"subprefix: {unit.branch.prefix}, "
+                f"to be checked address number: {address_count}"
+            )
+            print(
+                f"subprefix: {unit.branch.prefix}, "
+                f"found address number: {response_count}, "
+                f"response rate: {response_rate:.2%}, "
+                f"is FRP: {'yes' if meets_threshold else 'no'}"
+            )
 
         print(f"to be checked FRP number: {len(roots)}")
         print(f"found FRP number: {len(frp_set)}")
@@ -328,9 +279,9 @@ def checkFrp(
 ) -> set[str]:
     """自适应探测入口；scan_rate_bps 按需求解释为 packets/sec。
 
-    response_threshold 控制逐层剪枝，输入前缀是否进入返回集合仍由首层
-    全响应决定，因此 checkFrp(config, prefix_set) 保持原有 16/16 判定语义。
-    对 /128 等不足 16 个地址的前缀，与原代码一样要求实际地址全部响应。
+    每个输入前缀只探测一轮，响应率达到 response_threshold 即进入返回集合，
+    不扩展任何子前缀。传入 response_threshold=1.0 可复现原始 16/16 判定。
+    不足 16 个地址的前缀按实际生成地址数计算响应率。
     """
     pipeline = AdaptiveFrpPipeline(
         config=config,

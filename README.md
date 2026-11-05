@@ -68,10 +68,10 @@ python Strategy.py
 
 The pipeline consists of two components:
 
-- `AddressProducer`: generates up to 16 addresses for each active prefix and writes each layer to a temporary target file.
-- `ZMapConsumer`: scans the target file through ZMapv6 and returns the responsive addresses to the pruning scheduler.
+- `AddressProducer`: generates up to 16 addresses for each input prefix, one under each of the `0-f` child prefixes when space permits, and writes a temporary target file.
+- `ZMapConsumer`: scans the target file through ZMapv6 and returns the responsive addresses to the threshold-based classifier.
 
-Input prefixes are deduplicated and processed from shorter to longer prefixes. A branch is pruned when its response ratio is below `response_threshold`; only a 16/16 responsive branch is expanded to the next layer. The returned set keeps the legacy semantics: an input prefix is an FRP only when all addresses generated in its initial layer respond. For prefixes with fewer than 16 available addresses, all generated addresses must respond.
+Input prefixes are deduplicated and processed from shorter to longer prefixes. Every input prefix is probed exactly once: it is classified as FRP when its response ratio reaches `response_threshold`, and no child prefix is ever expanded. A 16/16 result has no special expansion behavior. For prefixes with fewer than 16 available addresses, the response ratio is calculated over the actual number of generated addresses. Set `response_threshold=1.0` to reproduce the original 16/16 acceptance rule.
 
 #### Runtime Configuration
 
