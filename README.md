@@ -62,9 +62,9 @@ python Strategy.py
 ```
 
 
-### 4. Adaptive Threshold Probing (Optional)
+### 4. Online Scanning (Adaptive Threshold Probing)
 
-`adaptive_probe.py` provides an optional single-round `checkFrp` implementation with adaptive branch pruning and a decoupled address-generation/scanning pipeline. For BGP-guided multi-round granularity correction, use `trap_det/trap.py` as described below.
+`adaptive_probe.py` implements Online Scanning as adaptive threshold probing, with a single-round `checkFrp` operation and a decoupled address-generation/scanning pipeline. A threshold of 100% (`response_threshold=1.0`) corresponds to the paper's 16/16 acceptance rule; lower thresholds are configurable alternatives. For subsequent BGP-guided multi-round granularity correction, use `trap_det/trap.py` as described below.
 
 The pipeline consists of two components:
 
@@ -116,9 +116,9 @@ frp_set = checkFrp(
 Calling `checkFrp(config, prefixes)` uses `response_threshold=0.75` and `scan_rate_bps=100`. Temporary target and result files are written below the two configured output directories.
 
 
-### 5. Online Scanning and Granularity Correction
+### 5. Granularity Correction
 
-The ICNP 2025 paper describes a three-stage pipeline: semantic learning, prefix inference, and online scanning. `trap_det/trap.py` implements the online scanning stage; `adaptive_probe.py` is a separate single-round alternative and is not part of the multi-round correction loop described below.
+The ICNP 2025 paper describes a three-stage pipeline: semantic learning, prefix inference, and online scanning. Online Scanning is the Adaptive Threshold Probing stage described above. `trap_det/trap.py` implements the multi-round granularity correction stage and its batch scheduling.
 
 #### Paper baseline (Section IV-D)
 
@@ -127,7 +127,7 @@ The paper divides online scanning into two operations:
 1. **FRP confirmation.** Probe 16 randomly selected addresses, one under each of the `0-f` child prefixes when the address space permits. Confirm the candidate as an FRP only when all 16 addresses respond. The evaluation uses the same 16/16 rule, and one probing budget represents 16 addresses within one prefix.
 2. **Granularity correction.** Starting from an initial correction length `lc`, progressively probe shorter prefixes and decay `lc` by half in successive rounds. The purpose is to correct prefix-length errors in existing FRP datasets rather than to infer unverified parents by aggregation alone.
 
-The paper does not prescribe a formula for choosing the initial `lc`, and it does not use a 75% acceptance threshold.
+The paper does not prescribe a formula for choosing the initial `lc`. Its baseline acceptance threshold is 100%; other threshold values are configurable implementation options.
 
 #### Repository implementation and engineering extensions
 
