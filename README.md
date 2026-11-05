@@ -155,13 +155,13 @@ python trap_det/trap.py \
     --no-early-stop \
     --batch-rate 5000 \
     --bgp-rate 10 \
-    --as-rate 50 \
-    --batch-targets 20000
+    --as-rate 0 \
+    --batch-targets 100000
 ```
 
 For the optional 75% mode, use `--response-threshold 0.75` and omit `--no-early-stop`. At threshold 1.0, early stopping after the first missing address is logically equivalent to the 16/16 decision, but it changes the number of probes and should be disabled when comparing against the paper's budget accounting.
 
-The batch scheduler defaults to a global maximum of 5000 packets/s, 10 packets/s per BGP prefix, 50 packets/s per AS, and 20000 addresses per batch. The default window is four seconds. Each batch invokes one ZMap process and pays its cooldown once. These are batch-window average limits, not a per-packet kernel token bucket.
+The batch scheduler defaults to a global maximum of 5000 packets/s, 10 packets/s per BGP prefix, no per-AS rate limit (`--as-rate 0`), and 100000 addresses per batch. The default window is therefore 20 seconds, allowing up to 200 addresses per BGP prefix per batch. Set `--as-rate` to a positive value to enable per-AS pacing. Each batch invokes one ZMap process and pays its cooldown once. These are batch-window average limits, not a per-packet kernel token bucket.
 
 Set `--batch-rate 0` to disable the new batch scheduler. The legacy single-batch path and independent per-prefix mode remain available; when using `--per-prefix-rate`, also set `--batch-rate 0`.
 

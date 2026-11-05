@@ -228,11 +228,13 @@ def _interleave_rate_groups(records):
 
 
 def _batch_window(config):
-    return max(
+    window = max(
         config['batch_targets'] / config['batch_rate'],
         1 / config['bgp_rate'],
-        1 / config['as_rate'],
     )
+    if config.get('as_rate'):
+        window = max(window, 1 / config['as_rate'])
+    return window
 
 
 def scan_target_batch(config, records):
@@ -269,7 +271,10 @@ def _take_rate_limited_batch(config, states, queue):
     batch_targets = config['batch_targets']
     window = _batch_window(config)
     bgp_quota = max(1, int(config['bgp_rate'] * window))
-    as_quota = max(1, int(config['as_rate'] * window))
+    as_quota = (
+        max(1, int(config['as_rate'] * window))
+        if config.get('as_rate') else None
+    )
     bgp_counts = {}
     as_counts = {}
     records = []
@@ -282,7 +287,10 @@ def _take_rate_limited_batch(config, states, queue):
         bgp_key, as_key = _route_keys(config, prefix, address)
         if (
             bgp_counts.get(bgp_key, 0) >= bgp_quota
-            or as_counts.get(as_key, 0) >= as_quota
+            or (
+                as_quota is not None
+                and as_counts.get(as_key, 0) >= as_quota
+            )
         ):
             deferred.append(prefix)
             continue
@@ -571,8 +579,11 @@ def main():
         help="批量模式的全局最高 ZMap pps；设为 0 可禁用批量模式"
     )
     parser.add_argument("--bgp-rate", type=float, default=10, help="批量模式每 BGP 时间窗平均 pps")
-    parser.add_argument("--as-rate", type=float, default=50, help="批量模式每 AS 时间窗平均 pps")
-    parser.add_argument("--batch-targets", type=int, default=20000, help="每批最大目标地址数")
+    parser.add_argument(
+        "--as-rate", type=float, default=0,
+        help="批量模式每 AS 时间窗平均 pps；设为 0 表示不限速"
+    )
+    parser.add_argument("--batch-targets", type=int, default=100000, help="每批最大目标地址数")
     parser.add_argument(
         "--no-early-stop", action="store_true",
         help="批量模式发送全部样本，不在结论已确定时提前停止"
@@ -597,9 +608,9 @@ def main():
         parser.error("--batch-rate 与 --per-prefix-rate 不能同时使用；逐前缀模式请设 --batch-rate 0")
     if (
         not math.isfinite(args.bgp_rate) or not math.isfinite(args.as_rate)
-        or args.bgp_rate <= 0 or args.as_rate <= 0
+        or args.bgp_rate <= 0 or args.as_rate < 0
     ):
-        parser.error("--bgp-rate 与 --as-rate 必须是有限的正数")
+        parser.error("--bgp-rate 必须为正数，--as-rate 必须为非负数（0 表示不限速）")
     if args.batch_targets <= 0:
         parser.error("--batch-targets 必须是正整数")
     if not args.dns_domain:
@@ -650,14 +661,11 @@ def main():
         f"fallback-nonpositive={jump_stats['nonpositive']}; fallback-step=8"
     )
     if args.batch_rate:
-        window = max(
-            args.batch_targets / args.batch_rate,
-            1 / args.bgp_rate,
-            1 / args.as_rate,
-        )
+        window = _batch_window(config)
+        as_rate_text = "unlimited" if args.as_rate == 0 else f"{args.as_rate} pps"
         print(
             f"Batch rate: global={args.batch_rate} pps; BGP={args.bgp_rate} pps; "
-            f"AS={args.as_rate} pps; window={window:.3f}s; "
+            f"AS={as_rate_text}; window={window:.3f}s; "
             f"early_stop={not args.no_early_stop}"
         )
 
