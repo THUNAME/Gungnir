@@ -109,6 +109,22 @@ def is_full_response(ipv6s, active, threshold):
     return active_count >= required_active_count(len(ipv6s), threshold)
 
 
+def read_active_addresses(path):
+    active = set()
+    with open(path, 'r') as f:
+        for line_number, line in enumerate(f, 1):
+            value = line.strip()
+            if not value or value == 'saddr':
+                continue
+            try:
+                active.add(ipaddress.IPv6Address(value).exploded)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"{path}:{line_number} 不是合法的 ZMap saddr 输出：{value!r}"
+                ) from exc
+    return active
+
+
 def scan_single_prefix(config, prefix):
     """每个前缀使用独立 ZMap 进程，确保其 --rate 只作用于当前前缀。"""
     ipv6s = prefix_to_sixteen(prefix)
@@ -132,11 +148,7 @@ def scan_single_prefix(config, prefix):
                 f.write(ip + "\n")
 
         startScaning(local_config)
-        with open(zmap_tmp.name, 'r') as f:
-            active = {
-                str(ipaddress.IPv6Address(line.strip()).exploded)
-                for line in f if line.strip()
-            }
+        active = read_active_addresses(zmap_tmp.name)
         return is_full_response(
             ipv6s, active, config.get('response_threshold', 1.0)
         )
@@ -244,11 +256,7 @@ def scan_target_batch(config, records):
             for _, address, _, _ in records:
                 f.write(address + "\n")
         startScaning(local_config)
-        with open(zmap_tmp.name, 'r') as f:
-            return {
-                ipaddress.IPv6Address(line.strip()).exploded
-                for line in f if line.strip()
-            }
+        return read_active_addresses(zmap_tmp.name)
     finally:
         for path in (gen_tmp.name, zmap_tmp.name):
             try:
@@ -389,10 +397,7 @@ def checkFrp(config, prefix_set):
     startScaning(config)
 
     # 读取 zmap 输出
-    active = set()
-    with open(config['zmap_result_path'], 'r') as f:
-        for line in f:
-            active.add(str(ipaddress.IPv6Address(line.strip()).exploded))
+    active = read_active_addresses(config['zmap_result_path'])
 
     # 计算 FRP
     threshold = config.get('response_threshold', 1.0)
@@ -454,7 +459,9 @@ def jump_outoftrap(prefix_dict, total_budget, config):
     jump_groups = {}
     source_count = 0
     for prefix, trap_len in prefix_dict.items():
-        if trap_len < 1:
+        prefix_len = int(prefix.rsplit('/', 1)[1])
+        # 成功上移后步长可能大于当前前缀长度；越过 /0 的分支正常结束。
+        if trap_len < 1 or trap_len > prefix_len:
             continue
         jump = make_jump_prefix(prefix, trap_len)
         jump_groups.setdefault(jump, []).append(prefix)
