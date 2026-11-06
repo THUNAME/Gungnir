@@ -64,18 +64,21 @@ python Strategy.py
 
 ### 4. Online Scanning (Adaptive Threshold Probing)
 
-`adaptive_probe.py` implements Online Scanning as adaptive threshold probing, with a single-round `checkFrp` operation and a decoupled address-generation/scanning pipeline. A threshold of 100% (`response_threshold=1.0`) corresponds to the paper's 16/16 acceptance rule; lower thresholds are configurable alternatives. For subsequent BGP-guided multi-round granularity correction, use `trap_det/trap.py` as described below.
+`adaptive_probe.py` implements single-round Online Scanning with a bounded, two-worker ZMap pipeline. A threshold of 100% (`response_threshold=1.0`) corresponds to the paper's 16/16 acceptance rule; lower thresholds are configurable alternatives. No child prefix is expanded. For subsequent BGP-guided multi-round granularity correction, use `trap_det/trap.py` as described below.
 
-The pipeline consists of two components:
+The pipeline works as follows:
 
-- `AddressProducer`: generates up to 16 addresses for each input prefix, one under each of the `0-f` child prefixes when space permits, and writes a temporary target file.
-- `ZMapConsumer`: scans the target file through ZMapv6 and returns the responsive addresses to the threshold-based classifier.
+- Normalize and deduplicate input prefixes, then use integer masks to generate each next sample on demand. Samples cover the `0-f` child prefixes when space permits; smaller address spaces are enumerated completely.
+- A central work-conserving scheduler queues targets by BGP prefix and interleave eligible groups. An idle or exhausted BGP group does not block other groups.
+- At most two ZMap workers run concurrently, allowing one worker to send while the other is in cooldown. Target generation, result parsing, and threshold updates overlap with scanning.
+- All workers share one 20-second accounting window. The default limits are 5000 packets/s globally, 10 packets/s per BGP prefix, and 100000 addresses per batch. Per-AS pacing is disabled by default (`as_rate_pps=0`). Thus a shared default window contains at most 100000 targets globally and 200 targets per BGP prefix, not those amounts per worker.
+- Each prefix stores its sent and responsive counts. With early stopping enabled, `hits >= ceil(total × response_threshold)` accepts immediately, while `hits + remaining < required` rejects immediately. At 0.75 this means 12 responses or five missing responses; at 1.0 the first missing address rejects. Set `early_stop=False` to send every sample.
 
-Input prefixes are deduplicated and processed from shorter to longer prefixes. Every input prefix is probed exactly once: it is classified as FRP when its response ratio reaches `response_threshold`, and no child prefix is ever expanded. A 16/16 result has no special expansion behavior. For prefixes with fewer than 16 available addresses, the response ratio is calculated over the actual number of generated addresses. Set `response_threshold=1.0` to reproduce the original 16/16 acceptance rule.
+These are shared time-window average limits, not a strict per-packet token bucket. Each batch logs its target count, assigned rate, remaining work, eligible BGP groups, and elapsed time.
 
 #### Runtime Configuration
 
-Install a ZMapv6 build that provides `icmp6_echoscan` and/or `ipv6_tcp_synscan`. Set the network-specific values through environment variables or the `config` dictionary; no local addresses, interface names, or gateway addresses are stored in the source code.
+Install a ZMapv6 build that provides `icmp6_echoscan` and/or `ipv6_tcp_synscan`. Set the network-specific values through environment variables or the `config` dictionary; no local addresses, interface names, or gateway addresses are stored in the source code. The scanner uses ZMap `--rate` directly in packets/s and each worker has an independent scanner closure.
 
 ```bash
 export GUNGNIR_LOCAL_IPV6='<your-source-ipv6>'
@@ -86,6 +89,8 @@ read -rsp "sudo password for ZMap: " GUNGNIR_SCAN_PASSWORD
 echo
 export GUNGNIR_SCAN_PASSWORD
 ```
+
+A pyasn database is required for per-BGP pacing. Set `bgp_dat` in `config`, or place the database at `data/latestv6.dat`. Tests and embedded callers can inject an initialized `bgp_db` instead. The pipeline fails rather than bypassing BGP pacing when the database is unavailable.
 
 Only probe networks that you are authorized to measure.
 
@@ -98,6 +103,7 @@ config = {
     "generated_folder_path": "scanningdata/generated_address/",
     "zmap_folder_path": "scanningdata/zmap_result/",
     "scanner": "tcp443",  # Omit this field for ICMPv6 probing.
+    "bgp_dat": "data/latestv6.dat",
 }
 
 prefixes = {
@@ -109,11 +115,16 @@ frp_set = checkFrp(
     config,
     prefixes,
     response_threshold=0.75,
-    scan_rate_bps=100,  # Packets per second, despite the historical parameter name.
+    scan_rate_bps=5000,  # Historical name; the value is packets/s.
+    bgp_rate_pps=10,
+    batch_targets=100000,
+    as_rate_pps=0,
+    zmap_workers=2,
+    early_stop=True,
 )
 ```
 
-Calling `checkFrp(config, prefixes)` uses `response_threshold=0.75` and `scan_rate_bps=100`. Temporary target and result files are written below the two configured output directories.
+Calling `checkFrp(config, prefixes)` uses the defaults shown above. Set `response_threshold=1.0` for the paper's 16/16 rule and `early_stop=False` when full 16-address budget accounting is required. Temporary target and result files are written below the two configured output directories and removed after each batch.
 
 
 ### 5. Granularity Correction

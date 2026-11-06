@@ -1,32 +1,37 @@
-"""自适应阈值 FRP 探测。
-
-本模块不修改 trap.py / trap_tcp.py。AddressProducer 只负责生成地址文件，
-ZMapConsumer 只负责调用 ZMapv6 并读取响应，AdaptiveFrpPipeline 负责单轮阈值判定。
-"""
+"""Single-round adaptive-threshold FRP probing with a bounded ZMap pipeline."""
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import secrets
 import time
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 try:
-    from zmapv6_runtime import DEFAULT_ZMAP, install_zmapv6
-except ImportError:  # 支持作为 Gungnir 包导入
-    from .zmapv6_runtime import DEFAULT_ZMAP, install_zmapv6
+    from zmapv6_runtime import DEFAULT_ZMAP, make_zmapv6_scanner
+except ImportError:
+    from .zmapv6_runtime import DEFAULT_ZMAP, make_zmapv6_scanner
 
 
 DEFAULT_RESPONSE_THRESHOLD = 0.75
-DEFAULT_SCAN_RATE_PPS = 100
+DEFAULT_SCAN_RATE_PPS = 5000
+DEFAULT_BGP_RATE_PPS = 10.0
+DEFAULT_BATCH_TARGETS = 100000
+DEFAULT_AS_RATE_PPS = 0.0
+DEFAULT_ZMAP_WORKERS = 2
+ROOT = Path(__file__).resolve().parent
+_PREFIX_MASKS = tuple(
+    ((1 << length) - 1) << (128 - length) for length in range(129)
+)
 
 
 @dataclass(frozen=True)
 class Branch:
-    """一个待探测分支；root 用于保持输入前缀与最终 FRP 的对应关系。"""
-
     root: str
     prefix: str
 
@@ -38,56 +43,125 @@ class ProbeUnit:
 
 
 @dataclass(frozen=True)
-class ProbeBatch:
-    """Producer 与 Consumer 之间传递的文件批次。"""
+class Target:
+    root: str
+    address: str
+    bgp_key: str
+    as_key: str
 
+
+@dataclass
+class ProbeBatch:
     depth: int
     units: tuple[ProbeUnit, ...]
     address_path: Path
     result_path: Path
+    targets: tuple[Target, ...] = ()
+    batch_id: int = 0
+    worker_id: int = 0
+    rate_pps: int = 1
+    window_seconds: float = 0.0
+    submitted_at: float = 0.0
 
     @property
     def address_count(self) -> int:
+        if self.targets:
+            return len(self.targets)
         return sum(len(unit.addresses) for unit in self.units)
 
 
 class Consumer(Protocol):
     def scan(self, batch: ProbeBatch) -> set[str]:
-        """扫描一个批次，返回规范化后的响应 IPv6 地址集合。"""
+        """Scan one batch and return canonical responsive addresses."""
+
+
+@dataclass
+class PrefixState:
+    root: str
+    network_int: int
+    prefix_len: int
+    total: int
+    required: int
+    sent: int = 0
+    hits: int = 0
+    next_address: str | None = None
+    next_bgp_key: str | None = None
+    next_as_key: str | None = None
+
+
+def _prefix_parts(prefix: str) -> tuple[int, int]:
+    address, length_text = prefix.strip().rsplit("/", 1)
+    prefix_len = int(length_text)
+    if not 0 <= prefix_len <= 128:
+        raise ValueError(f"invalid IPv6 prefix length: {prefix!r}")
+    network_int = int(ipaddress.IPv6Address(address)) & _PREFIX_MASKS[prefix_len]
+    return network_int, prefix_len
 
 
 def _canonical_prefix(prefix: str) -> str:
-    return str(ipaddress.IPv6Network(prefix.strip(), strict=False))
+    network_int, prefix_len = _prefix_parts(prefix)
+    return f"{ipaddress.IPv6Address(network_int)}/{prefix_len}"
 
 
 def _canonical_address(address: str) -> str:
     return str(ipaddress.IPv6Address(address.strip()))
 
 
+def _sample_count(prefix_len: int) -> int:
+    return min(16, 1 << (128 - prefix_len))
+
+
+def _sample_address(network_int: int, prefix_len: int, index: int) -> str:
+    host_bits = 128 - prefix_len
+    if not 0 <= index < _sample_count(prefix_len):
+        raise IndexError("sample index exceeds the prefix address space")
+    if host_bits < 4:
+        value = network_int + index
+    else:
+        value = network_int | (index << (host_bits - 4))
+        if host_bits > 4:
+            value |= secrets.randbits(host_bits - 4)
+    return str(ipaddress.IPv6Address(value))
+
+
 def _generate_addresses(prefix: str) -> tuple[str, ...]:
-    """生成最多 16 个地址，依次覆盖接下来的 0..15 子前缀。"""
-    network = ipaddress.IPv6Network(prefix, strict=False)
-    remaining = 128 - network.prefixlen
-    count = min(1 << remaining, 16)
+    """Compatibility helper using the same on-demand integer sampler."""
+    network_int, prefix_len = _prefix_parts(prefix)
+    return tuple(
+        _sample_address(network_int, prefix_len, index)
+        for index in range(_sample_count(prefix_len))
+    )
 
-    if remaining <= 4:
-        return tuple(
-            str(ipaddress.IPv6Address(int(network.network_address) + index))
-            for index in range(count)
-        )
 
-    host_bits = remaining - 4
-    addresses = []
-    for index in range(16):
-        suffix = (index << host_bits) | secrets.randbits(host_bits)
-        addresses.append(
-            str(ipaddress.IPv6Address(int(network.network_address) | suffix))
-        )
-    return tuple(addresses)
+def _required_count(sample_count: int, threshold: float) -> int:
+    return max(1, math.ceil(sample_count * threshold))
+
+
+def _read_active_addresses(path: Path) -> set[str]:
+    active = set()
+    with path.open("r", encoding="utf-8") as result_file:
+        for line_number, line in enumerate(result_file, 1):
+            value = line.strip()
+            if not value or value == "saddr":
+                continue
+            try:
+                active.add(_canonical_address(value))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"{path}:{line_number} is not a valid ZMap saddr row: {value!r}"
+                ) from exc
+    return active
+
+
+def _required_setting(config: dict[str, Any], key: str, env_name: str) -> str:
+    value = config.get(key) or os.environ.get(env_name)
+    if not value:
+        raise ValueError(f"{key} must be set in config or {env_name}")
+    return str(value)
 
 
 class AddressProducer:
-    """Producer：计算一批活跃分支的地址并写入临时文件，不调用 subprocess。"""
+    """Write bounded batches while scans and result processing run elsewhere."""
 
     def __init__(self, generated_dir: Path, result_dir: Path):
         self.generated_dir = generated_dir
@@ -96,6 +170,7 @@ class AddressProducer:
         self.result_dir.mkdir(parents=True, exist_ok=True)
 
     def produce(self, branches: list[Branch], depth: int) -> ProbeBatch:
+        """Retain the original single-batch producer as a compatibility API."""
         units = tuple(
             ProbeUnit(branch=branch, addresses=_generate_addresses(branch.prefix))
             for branch in branches
@@ -103,58 +178,55 @@ class AddressProducer:
         stem = f"adaptive_{time.time_ns()}_{depth}"
         address_path = self.generated_dir / f"{stem}.txt"
         result_path = self.result_dir / f"{stem}.txt"
-
         with address_path.open("w", encoding="utf-8") as output:
             for unit in units:
                 for address in unit.addresses:
                     output.write(address + "\n")
+        return ProbeBatch(depth, units, address_path, result_path)
 
+    def produce_targets(
+        self,
+        targets: list[Target],
+        batch_id: int,
+        worker_id: int,
+        rate_pps: int,
+        window_seconds: float,
+    ) -> ProbeBatch:
+        stem = f"adaptive_{time.time_ns()}_{batch_id}_{worker_id}"
+        address_path = self.generated_dir / f"{stem}.txt"
+        result_path = self.result_dir / f"{stem}.txt"
+        with address_path.open("w", encoding="utf-8") as output:
+            for target in targets:
+                output.write(target.address + "\n")
         return ProbeBatch(
-            depth=depth,
-            units=units,
+            depth=0,
+            units=(),
             address_path=address_path,
             result_path=result_path,
+            targets=tuple(targets),
+            batch_id=batch_id,
+            worker_id=worker_id,
+            rate_pps=rate_pps,
+            window_seconds=window_seconds,
         )
 
 
-def _required_setting(config: dict[str, Any], key: str, env_name: str) -> str:
-    """从 config 或环境变量读取敏感网络配置，不在源码中保存默认值。"""
-    value = config.get(key) or os.environ.get(env_name)
-    if not value:
-        raise ValueError(f"{key} must be set in config or {env_name}")
-    return str(value)
-
-
 class ZMapConsumer:
-    """Consumer：复用 zmapv6_runtime 的绝对路径、接口和动态库配置。"""
+    """A single-worker consumer with an isolated ZMap scanner closure."""
 
-    def __init__(self, config: dict[str, Any], scan_rate_bps: int):
+    def __init__(self, config: dict[str, Any], scan_rate_bps: int, worker_id: int = 0):
         self.config = dict(config)
         self.scan_rate_bps = scan_rate_bps
+        self.worker_id = worker_id
         scanner_name = str(self.config.get("scanner", ""))
         probe_module = str(self.config.get("probe_module", ""))
         is_tcp = scanner_name == "tcp443" or probe_module == "ipv6_tcp_synscan"
-
-        if is_tcp:
-            try:
-                from trap_det import trap_tcp as scanner_module
-            except ImportError:
-                from .trap_det import trap_tcp as scanner_module
-        else:
-            try:
-                from trap_det import trap as scanner_module
-            except ImportError:
-                from .trap_det import trap as scanner_module
-
-        # 以 128 字节作为保守线速包长，并配合批次节奏限制平均 pps。
-        estimated_bandwidth = scan_rate_bps * 128 * 8
         zmap_path = (
             self.config.get("zmap_path")
             or os.environ.get("GUNGNIR_ZMAP_PATH")
             or DEFAULT_ZMAP
         )
-        install_zmapv6(
-            scanner_module,
+        self._start_scanning = make_zmapv6_scanner(
             interface=_required_setting(
                 self.config, "interface", "GUNGNIR_INTERFACE"
             ),
@@ -162,9 +234,9 @@ class ZMapConsumer:
             gateway_mac=_required_setting(
                 self.config, "gateway_mac", "GUNGNIR_GATEWAY_MAC"
             ),
-            bandwidth=str(estimated_bandwidth),
+            rate_pps=scan_rate_bps,
+            is_tcp=is_tcp,
         )
-        self._start_scanning = scanner_module.startScaning
 
     def scan(self, batch: ProbeBatch) -> set[str]:
         scan_config = dict(self.config)
@@ -176,29 +248,30 @@ class ZMapConsumer:
         scan_config["passport"] = _required_setting(
             scan_config, "passport", "GUNGNIR_SCAN_PASSWORD"
         )
+        scan_config["rate_pps"] = batch.rate_pps or self.scan_rate_bps
 
         started = time.monotonic()
-        self._start_scanning(scan_config)
-
-        # 即使扫描器提前返回，批次平均速率也不超过 scan_rate_bps（pp/s）。
-        minimum_duration = batch.address_count / self.scan_rate_bps
-        remaining_sleep = minimum_duration - (time.monotonic() - started)
-        if remaining_sleep > 0:
-            time.sleep(remaining_sleep)
-
-        if not batch.result_path.exists():
-            raise RuntimeError(f"ZMapv6 result file not found: {batch.result_path}")
-
-        with batch.result_path.open("r", encoding="utf-8") as result_file:
-            return {
-                _canonical_address(line)
-                for line in result_file
-                if line.strip()
-            }
+        try:
+            self._start_scanning(scan_config)
+            minimum_duration = batch.window_seconds or (
+                batch.address_count / scan_config["rate_pps"]
+            )
+            remaining_sleep = minimum_duration - (time.monotonic() - started)
+            if remaining_sleep > 0:
+                time.sleep(remaining_sleep)
+            if not batch.result_path.exists():
+                raise RuntimeError(f"ZMapv6 result file not found: {batch.result_path}")
+            return _read_active_addresses(batch.result_path)
+        finally:
+            for path in (batch.address_path, batch.result_path):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 class AdaptiveFrpPipeline:
-    """执行单轮 Producer -> Consumer -> 阈值判定，不扩展任何子前缀。"""
+    """Work-conserving, shared-window, single-round FRP classification."""
 
     def __init__(
         self,
@@ -206,15 +279,38 @@ class AdaptiveFrpPipeline:
         response_threshold: float = DEFAULT_RESPONSE_THRESHOLD,
         scan_rate_bps: int = DEFAULT_SCAN_RATE_PPS,
         consumer: Consumer | None = None,
+        bgp_rate_pps: float = DEFAULT_BGP_RATE_PPS,
+        batch_targets: int = DEFAULT_BATCH_TARGETS,
+        as_rate_pps: float = DEFAULT_AS_RATE_PPS,
+        zmap_workers: int = DEFAULT_ZMAP_WORKERS,
+        early_stop: bool = True,
     ):
-        if not 0.0 <= response_threshold <= 1.0:
-            raise ValueError("response_threshold must be between 0 and 1")
-        if scan_rate_bps <= 0:
-            raise ValueError("scan_rate_bps must be a positive packets/sec value")
+        if not 0.0 < response_threshold <= 1.0:
+            raise ValueError("response_threshold must be in (0, 1]")
+        numeric_rates = (scan_rate_bps, bgp_rate_pps, as_rate_pps)
+        if not all(math.isfinite(value) for value in numeric_rates):
+            raise ValueError("rate values must be finite")
+        if scan_rate_bps <= 0 or bgp_rate_pps <= 0 or as_rate_pps < 0:
+            raise ValueError("global/BGP rates must be positive and AS rate non-negative")
+        if batch_targets <= 0:
+            raise ValueError("batch_targets must be positive")
+        if zmap_workers not in (1, 2):
+            raise ValueError("zmap_workers must be 1 or 2")
+        if consumer is not None and zmap_workers != 1:
+            zmap_workers = 1
 
         self.config = dict(config)
         self.response_threshold = response_threshold
         self.scan_rate_bps = scan_rate_bps
+        self.bgp_rate_pps = bgp_rate_pps
+        self.batch_targets = batch_targets
+        self.as_rate_pps = as_rate_pps
+        self.early_stop = early_stop
+        self.window_seconds = max(
+            batch_targets / scan_rate_bps,
+            1 / bgp_rate_pps,
+            1 / as_rate_pps if as_rate_pps else 0.0,
+        )
         generated_dir = Path(
             self.config.get("generated_folder_path", "scanningdata/generated_address")
         )
@@ -222,53 +318,265 @@ class AdaptiveFrpPipeline:
             self.config.get("zmap_folder_path", "scanningdata/zmap_result")
         )
         self.producer = AddressProducer(generated_dir, result_dir)
-        self.consumer = consumer or ZMapConsumer(self.config, scan_rate_bps)
+        if consumer is not None:
+            self.consumers = [consumer]
+        else:
+            self.consumers = [
+                ZMapConsumer(self.config, scan_rate_bps, worker_id=index)
+                for index in range(zmap_workers)
+            ]
+        self.consumer = self.consumers[0]
+        self.bgp_db = self.config.get("bgp_db") or self._load_bgp_db()
+        self.states: dict[str, PrefixState] = {}
+        self.groups: dict[str, deque[str]] = {}
+        self._next_batch_id = 0
+        self._total_probes = 0
+        self._early_accept = 0
+        self._early_reject = 0
+        self._frp_set: set[str] = set()
+
+    def _load_bgp_db(self):
+        try:
+            import pyasn
+        except ImportError as exc:
+            raise RuntimeError("per-BGP pacing requires pyasn") from exc
+        database = self.config.get("bgp_dat", str(ROOT / "data" / "latestv6.dat"))
+        return pyasn.pyasn(str(database))
+
+    def _enqueue(self, root: str) -> None:
+        state = self.states[root]
+        if state.sent >= state.total:
+            return
+        address = _sample_address(state.network_int, state.prefix_len, state.sent)
+        asn, bgp_prefix = self.bgp_db.lookup(address)
+        state.next_address = address
+        state.next_bgp_key = bgp_prefix or f"unmatched-bgp:{root}"
+        state.next_as_key = (
+            str(asn) if asn is not None else f"unmatched-as:{root}"
+        )
+        self.groups.setdefault(state.next_bgp_key, deque()).append(root)
+
+    def _has_pending(self) -> bool:
+        return any(self.groups.values())
+
+    def _take_targets(
+        self,
+        capacity: int,
+        bgp_quota: int,
+        bgp_remaining: dict[str, int],
+        as_quota: int | None,
+        as_remaining: dict[str, int],
+    ) -> list[Target]:
+        records = []
+        keys = deque(self.groups)
+        while keys and len(records) < capacity:
+            bgp_key = keys.popleft()
+            group = self.groups.get(bgp_key)
+            if not group:
+                continue
+            if bgp_remaining.get(bgp_key, bgp_quota) <= 0:
+                continue
+            state = self.states[group[0]]
+            as_key = state.next_as_key
+            if (
+                as_quota is not None
+                and as_remaining.get(as_key, as_quota) <= 0
+            ):
+                continue
+
+            group.popleft()
+            target = Target(
+                root=state.root,
+                address=state.next_address,
+                bgp_key=state.next_bgp_key,
+                as_key=as_key,
+            )
+            state.sent += 1
+            state.next_address = None
+            state.next_bgp_key = None
+            state.next_as_key = None
+            records.append(target)
+            bgp_remaining[bgp_key] = bgp_remaining.get(bgp_key, bgp_quota) - 1
+            if as_quota is not None:
+                as_remaining[as_key] = as_remaining.get(as_key, as_quota) - 1
+            if group:
+                keys.append(bgp_key)
+        return records
+
+    def _produce_window(self, worker_ids: list[int]) -> list[ProbeBatch]:
+        global_remaining = max(1, int(self.scan_rate_bps * self.window_seconds))
+        bgp_quota = max(1, int(self.bgp_rate_pps * self.window_seconds))
+        as_quota = (
+            max(1, int(self.as_rate_pps * self.window_seconds))
+            if self.as_rate_pps else None
+        )
+        bgp_remaining: dict[str, int] = {}
+        as_remaining: dict[str, int] = {}
+        batches = []
+
+        for worker_id in worker_ids:
+            if global_remaining <= 0 or not self._has_pending():
+                break
+            records = self._take_targets(
+                min(self.batch_targets, global_remaining),
+                bgp_quota,
+                bgp_remaining,
+                as_quota,
+                as_remaining,
+            )
+            if not records:
+                break
+            rate_pps = max(1, int(len(records) / self.window_seconds))
+            batch = self.producer.produce_targets(
+                targets=records,
+                batch_id=self._next_batch_id,
+                worker_id=worker_id,
+                rate_pps=min(self.scan_rate_bps, rate_pps),
+                window_seconds=self.window_seconds,
+            )
+            self._next_batch_id += 1
+            batches.append(batch)
+            global_remaining -= len(records)
+        return batches
+
+    def _process_future(self, future: Future, futures: dict[Future, ProbeBatch]) -> None:
+        batch = futures.pop(future)
+        active = future.result()
+        scheduled = set()
+        for target in batch.targets:
+            scheduled.add(target.root)
+            if target.address in active:
+                self.states[target.root].hits += 1
+
+        for root in scheduled:
+            state = self.states[root]
+            remaining = state.total - state.sent
+            complete = state.sent == state.total
+            enough = state.hits >= state.required
+            impossible = state.hits + remaining < state.required
+            if self.early_stop and enough:
+                self._frp_set.add(root)
+                self._early_accept += 1
+            elif self.early_stop and impossible:
+                self._early_reject += 1
+            elif complete:
+                if enough:
+                    self._frp_set.add(root)
+            else:
+                self._enqueue(root)
+
+        pending_prefixes = sum(
+            state.next_address is not None for state in self.states.values()
+        )
+        pending_samples = sum(
+            state.total - state.sent
+            for state in self.states.values()
+            if state.next_address is not None
+        )
+        print(
+            f"Online batch {batch.batch_id}: worker={batch.worker_id}; "
+            f"targets={batch.address_count}; rate={batch.rate_pps} pps; "
+            f"elapsed={time.monotonic() - batch.submitted_at:.3f}s; "
+            f"pending_prefixes={pending_prefixes}; pending_samples={pending_samples}; "
+            f"eligible_bgp={sum(bool(group) for group in self.groups.values())}",
+            flush=True,
+        )
 
     def run(self, prefix_set: set[str] | list[str] | tuple[str, ...]) -> set[str]:
-        networks = {
-            ipaddress.IPv6Network(prefix.strip(), strict=False)
-            for prefix in prefix_set
-            if prefix and prefix.strip()
-        }
-        ordered = sorted(
-            networks,
-            key=lambda network: (network.prefixlen, int(network.network_address)),
-        )
-        roots = [str(network) for network in ordered]
-        if not roots:
+        roots = set()
+        for prefix in prefix_set:
+            if prefix and prefix.strip():
+                network_int, prefix_len = _prefix_parts(prefix)
+                roots.add((prefix_len, network_int))
+        ordered = sorted(roots)
+        if not ordered:
             print("to be checked FRP number: 0")
             print("found FRP number: 0")
             return set()
 
-        branches = [Branch(root=root, prefix=root) for root in roots]
-        batch = self.producer.produce(branches, depth=0)
-        active_addresses = self.consumer.scan(batch)
-        frp_set: set[str] = set()
-
-        for unit in batch.units:
-            addresses = unit.addresses
-            response_count = sum(address in active_addresses for address in addresses)
-            address_count = len(addresses)
-            response_rate = response_count / address_count
-            meets_threshold = response_rate >= self.response_threshold
-
-            if meets_threshold:
-                frp_set.add(unit.branch.root)
-
-            print(
-                f"subprefix: {unit.branch.prefix}, "
-                f"to be checked address number: {address_count}"
+        self.states = {}
+        self.groups = {}
+        self._frp_set = set()
+        self._total_probes = 0
+        self._early_accept = 0
+        self._early_reject = 0
+        self._next_batch_id = 0
+        for prefix_len, network_int in ordered:
+            root = f"{ipaddress.IPv6Address(network_int)}/{prefix_len}"
+            total = _sample_count(prefix_len)
+            self.states[root] = PrefixState(
+                root=root,
+                network_int=network_int,
+                prefix_len=prefix_len,
+                total=total,
+                required=_required_count(total, self.response_threshold),
             )
-            print(
-                f"subprefix: {unit.branch.prefix}, "
-                f"found address number: {response_count}, "
-                f"response rate: {response_rate:.2%}, "
-                f"is FRP: {'yes' if meets_threshold else 'no'}"
-            )
+            self._enqueue(root)
 
-        print(f"to be checked FRP number: {len(roots)}")
-        print(f"found FRP number: {len(frp_set)}")
-        return frp_set
+        futures: dict[Future, ProbeBatch] = {}
+        next_window = time.monotonic()
+        with ThreadPoolExecutor(max_workers=len(self.consumers)) as executor:
+            while self._has_pending() or futures:
+                done = [future for future in futures if future.done()]
+                if done:
+                    for future in done:
+                        self._process_future(future, futures)
+                    continue
+
+                busy_workers = {batch.worker_id for batch in futures.values()}
+                free_workers = [
+                    index for index in range(len(self.consumers))
+                    if index not in busy_workers
+                ]
+                if free_workers and self._has_pending():
+                    now = time.monotonic()
+                    if now < next_window:
+                        timeout = next_window - now
+                        if futures:
+                            done, _ = wait(
+                                futures,
+                                timeout=timeout,
+                                return_when=FIRST_COMPLETED,
+                            )
+                            if done:
+                                for future in done:
+                                    self._process_future(future, futures)
+                                continue
+                        else:
+                            time.sleep(timeout)
+                        if time.monotonic() < next_window:
+                            continue
+
+                    batches = self._produce_window(free_workers)
+                    if not batches:
+                        raise RuntimeError("scheduler has pending states but produced no batch")
+                    # 文件生成不计入窗口间隔，避免下一批提前发送并叠加速率。
+                    window_started = time.monotonic()
+                    for batch in batches:
+                        batch.submitted_at = window_started
+                        future = executor.submit(
+                            self.consumers[batch.worker_id].scan, batch
+                        )
+                        futures[future] = batch
+                        self._total_probes += batch.address_count
+                    next_window = window_started + self.window_seconds
+                    continue
+
+                if futures:
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        self._process_future(future, futures)
+                elif self._has_pending():
+                    raise RuntimeError("no worker available for pending states")
+
+        print(f"to be checked FRP number: {len(self.states)}")
+        print(f"found FRP number: {len(self._frp_set)}")
+        print(
+            f"Online scan: batches={self._next_batch_id}; probes={self._total_probes}; "
+            f"early_accept={self._early_accept}; early_reject={self._early_reject}; "
+            f"workers={len(self.consumers)}; window={self.window_seconds:.3f}s"
+        )
+        return self._frp_set
 
 
 def checkFrp(
@@ -276,16 +584,22 @@ def checkFrp(
     prefix_set: set[str] | list[str] | tuple[str, ...],
     response_threshold: float = DEFAULT_RESPONSE_THRESHOLD,
     scan_rate_bps: int = DEFAULT_SCAN_RATE_PPS,
+    *,
+    bgp_rate_pps: float = DEFAULT_BGP_RATE_PPS,
+    batch_targets: int = DEFAULT_BATCH_TARGETS,
+    as_rate_pps: float = DEFAULT_AS_RATE_PPS,
+    zmap_workers: int = DEFAULT_ZMAP_WORKERS,
+    early_stop: bool = True,
 ) -> set[str]:
-    """自适应探测入口；scan_rate_bps 按需求解释为 packets/sec。
-
-    每个输入前缀只探测一轮，响应率达到 response_threshold 即进入返回集合，
-    不扩展任何子前缀。传入 response_threshold=1.0 可复现原始 16/16 判定。
-    不足 16 个地址的前缀按实际生成地址数计算响应率。
-    """
+    """Classify each input prefix once without expanding any child prefix."""
     pipeline = AdaptiveFrpPipeline(
         config=config,
         response_threshold=response_threshold,
         scan_rate_bps=scan_rate_bps,
+        bgp_rate_pps=bgp_rate_pps,
+        batch_targets=batch_targets,
+        as_rate_pps=as_rate_pps,
+        zmap_workers=zmap_workers,
+        early_stop=early_stop,
     )
     return pipeline.run(prefix_set)
