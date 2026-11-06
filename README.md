@@ -78,16 +78,13 @@ These are shared time-window average limits, not a strict per-packet token bucke
 
 #### Runtime Configuration
 
-Install a ZMapv6 build that provides `icmp6_echoscan` and/or `ipv6_tcp_synscan`. Set the network-specific values through environment variables or the `config` dictionary; no local addresses, interface names, or gateway addresses are stored in the source code. The scanner uses ZMap `--rate` directly in packets/s and each worker has an independent scanner closure.
+Install a ZMapv6 build that provides `icmp6_echoscan`, `ipv6_tcp_synscan`, and `ipv6_dns`. Set network-specific values through the CLI, environment variables, or the `config` dictionary. The scanner uses ZMap `--rate` directly in packets/s and each worker has an independent scanner closure. Production scans use `sudo -n`; configure non-interactive privilege in advance rather than providing a password to the process. Gateway MAC is optional and is included only when explicitly configured.
 
 ```bash
 export GUNGNIR_LOCAL_IPV6='<your-source-ipv6>'
 export GUNGNIR_INTERFACE='<your-interface>'
-export GUNGNIR_GATEWAY_MAC='<your-gateway-mac>'
-export GUNGNIR_ZMAP_PATH='/path/to/zmap'  # Optional when using the default local build
-read -rsp "sudo password for ZMap: " GUNGNIR_SCAN_PASSWORD
-echo
-export GUNGNIR_SCAN_PASSWORD
+export GUNGNIR_GATEWAY_MAC='<your-gateway-mac>'  # Optional
+export GUNGNIR_ZMAP_PATH='/path/to/zmap'
 ```
 
 A pyasn database is required for per-BGP pacing. Set `bgp_dat` in `config`, or place the database at `data/latestv6.dat`. Tests and embedded callers can inject an initialized `bgp_db` instead. The pipeline fails rather than bypassing BGP pacing when the database is unavailable.
@@ -124,7 +121,35 @@ frp_set = checkFrp(
 )
 ```
 
-Calling `checkFrp(config, prefixes)` uses the defaults shown above. Set `response_threshold=1.0` for the paper's 16/16 rule and `early_stop=False` when full 16-address budget accounting is required. Temporary target and result files are written below the two configured output directories and removed after each batch.
+Calling `checkFrp(config, prefixes)` uses the defaults shown above. Set `response_threshold=1.0` for the paper's 16/16 rule and `early_stop=False` when full 16-address budget accounting is required. Temporary target and result files are written below the two configured output directories and removed after each batch. Set `protocol` to `icmp`, `tcp`, or `udp`, with `port` set to 80, 443, or 53 as appropriate. UDP/53 uses `ipv6_dns` and `dns_domain`.
+
+#### Production CLI and four-protocol scheduling
+
+`ipv6_bulk_zmap_scan_nibble.py` is now a production CLI around this pipeline. It atomically writes the exact threshold-accepted CIDR set plus a `run_id`-scoped audit JSON. It does not apply the legacy extractor's separate "at least 10 responses" rule, so small address spaces retain the same `ceil(samples × threshold)` semantics as the Python API.
+
+```bash
+python ipv6_bulk_zmap_scan_nibble.py \
+    --input /path/to/candidates.txt --output-frp /path/to/active.txt \
+    --out-json /path/to/active.json --run-id '<unique-run-id>' \
+    --protocol tcp --port 80 --interface eth0 \
+    --local-ipv6 '<your-source-ipv6>' --zmap-bin zmap \
+    --bgp-dat data/latestv6.dat \
+    --generated-folder /tmp/gungnir/generated \
+    --zmap-folder /tmp/gungnir/results \
+    --response-threshold 0.75 --rate 5000 --bgp-rate 10 \
+    --as-rate 0 --batch-targets 100000 --workers 2
+```
+
+`run_week.sh` schedules ICMPv6, TCP80, TCP443, and UDP53 sequentially so their limits do not stack. Its default long-running path is `make_Prediction → Strategy → active scanning → granularity correction`. Every protocol runs in `/home/wct/Gungnir_result/<run_id>/`; only after all four succeed are the shortest covering results atomically published under `server_gungnir`. Any failed stage prevents publication of a partial four-protocol set.
+
+To refresh from the latest existing four snapshots without rerunning the model or consuming the much larger `PredictionFRP` files:
+
+```bash
+SKIP_GENERATION=1 USE_LATEST_SNAPSHOTS=1 UPLOAD_RESULTS=1 \
+RESPONSE_THRESHOLD=0.75 /home/wct/Gungnir/run_week.sh
+```
+
+This mode freezes and hashes all four input snapshot paths before scanning, applies shortest-cover filtering before active scanning and after granularity correction, and invokes `/home/wct/upload/run.sh` only after all four final files are published. Set `UPLOAD_RESULTS=0` to keep results local. The optional 75% mode used by the scheduler is not the paper's 100% baseline.
 
 
 ### 5. Granularity Correction

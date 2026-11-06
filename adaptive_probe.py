@@ -220,7 +220,16 @@ class ZMapConsumer:
         self.worker_id = worker_id
         scanner_name = str(self.config.get("scanner", ""))
         probe_module = str(self.config.get("probe_module", ""))
-        is_tcp = scanner_name == "tcp443" or probe_module == "ipv6_tcp_synscan"
+        protocol = str(self.config.get("protocol", ""))
+        if not protocol:
+            protocol = "udp" if probe_module == "ipv6_dns" else (
+                "tcp" if scanner_name in {"tcp80", "tcp443"}
+                or probe_module == "ipv6_tcp_synscan" else "icmp"
+            )
+        default_port = {"tcp80": 80, "tcp443": 443, "udp53": 53}.get(
+            scanner_name, 443 if protocol == "tcp" else 53 if protocol == "udp" else 0
+        )
+        port = int(self.config.get("port", default_port))
         zmap_path = (
             self.config.get("zmap_path")
             or os.environ.get("GUNGNIR_ZMAP_PATH")
@@ -231,11 +240,12 @@ class ZMapConsumer:
                 self.config, "interface", "GUNGNIR_INTERFACE"
             ),
             zmap_path=str(zmap_path),
-            gateway_mac=_required_setting(
-                self.config, "gateway_mac", "GUNGNIR_GATEWAY_MAC"
-            ),
+            gateway_mac=self.config.get("gateway_mac")
+            or os.environ.get("GUNGNIR_GATEWAY_MAC"),
             rate_pps=scan_rate_bps,
-            is_tcp=is_tcp,
+            protocol=protocol,
+            port=port,
+            dns_domain=str(self.config.get("dns_domain", "example.com")),
         )
 
     def scan(self, batch: ProbeBatch) -> set[str]:
@@ -244,9 +254,6 @@ class ZMapConsumer:
         scan_config["zmap_result_path"] = str(batch.result_path)
         scan_config["local_ipv6"] = _required_setting(
             scan_config, "local_ipv6", "GUNGNIR_LOCAL_IPV6"
-        )
-        scan_config["passport"] = _required_setting(
-            scan_config, "passport", "GUNGNIR_SCAN_PASSWORD"
         )
         scan_config["rate_pps"] = batch.rate_pps or self.scan_rate_bps
 
@@ -481,6 +488,21 @@ class AdaptiveFrpPipeline:
             f"eligible_bgp={sum(bool(group) for group in self.groups.values())}",
             flush=True,
         )
+
+    def summary(self) -> dict[str, int | float]:
+        """Return stable run metrics for production manifests and monitoring."""
+        return {
+            "input_prefixes": len(self.states),
+            "frp_prefixes": len(self._frp_set),
+            "total_batches": self._next_batch_id,
+            "completed_batches": self._next_batch_id,
+            "failed_batches": 0,
+            "probes": self._total_probes,
+            "early_accept": self._early_accept,
+            "early_reject": self._early_reject,
+            "workers": len(self.consumers),
+            "window_seconds": self.window_seconds,
+        }
 
     def run(self, prefix_set: set[str] | list[str] | tuple[str, ...]) -> set[str]:
         roots = set()
