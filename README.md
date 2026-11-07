@@ -217,7 +217,7 @@ python tools/select_shortest_prefixes.py \
 
 ## Citation
 
-If you find this paper useful in your research, please cite this paper.
+Gungnir, Luori (conference version), and its journal extension (IEEE Transactions on Networking 2026) are a series of our research work on IPv6 Fully Responsive Prefix (FRP) discovery. If these works are helpful to your research, you are welcome to cite them and follow our ongoing work in this series.
 
 ```
 @inproceedings{Wei2025gungnir,
@@ -230,7 +230,32 @@ If you find this paper useful in your research, please cite this paper.
   address = {Seoul, South Korea},
   date = {September 22-25},
 }
+```
 
+```
+@INPROCEEDINGS{cheng2024luori,
+  author={Cheng, Daguo and He, Lin and Wei, Chentian and Yin, Qilei and Jin, Boran and Wang, Zhaoan and Pan, Xiaoteng and Zhou, Sixu and Liu, Ying and Zhang, Shenglin and Tan, Fuchao and Liu, Wenmao},
+  booktitle={2024 IEEE 32nd International Conference on Network Protocols (ICNP)},
+  title={Luori: Active Probing and Evaluation of Internet-Wide IPv6 Fully Responsive Prefixes},
+  year={2024},
+  volume={},
+  number={},
+  pages={1-12},
+  keywords={Protocols;Current measurement;Reinforcement learning;Transforms;Routing;Optimization;IPv6;fully responsive prefix;active probing},
+  doi={10.1109/ICNP61940.2024.10858548}}
+```
+
+```
+@ARTICLE{11616620,
+  author={He, Lin and Wei, Chentian and Cheng, Daguo and Yin, Qilei and Jin, Boran and Wang, Zhaoan and Pan, Xiaoteng and Zhou, Sixu and Liu, Ying and Zhang, Shenglin and Tan, Fuchao and Liu, Wenmao},
+  journal={IEEE Transactions on Networking},
+  title={Do Not Fall Into the Trap: Efficiently Discovering IPv6 Fully Responsive Prefixes in the Wild},
+  year={2026},
+  volume={34},
+  number={},
+  pages={6364-6379},
+  keywords={Probes;Internet;Seeds (agriculture);Trees (botanical);Vegetation;Measurement;Ports (computers);Pediatrics;Conferences;Routing;IPv6;fully responsive prefix;active probing},
+  doi={10.1109/TON.2026.3715537}}
 ```
 
 ## License
