@@ -9,16 +9,13 @@ FRP_ROOT=${FRP_ROOT:-/home/wct/FRP-watcher/server_gungnir}
 UPLOAD_SCRIPT=${UPLOAD_SCRIPT:-/home/wct/upload/run.sh}
 LOCAL_IPV6=${LOCAL_IPV6:-2408:400a:76a:b00::9}
 INTERFACE=${INTERFACE:-eth0}
-ZMAP_BIN=${ZMAP_BIN:-zmap}
 DNS_DOMAIN=${DNS_DOMAIN:-example.com}
 SCAN_RATE=${SCAN_RATE:-0}
 BGP_RATE=${BGP_RATE:-10}
 AS_RATE=${AS_RATE:-0}
 BATCH_TARGETS=${BATCH_TARGETS:-0}
-ZMAP_WORKERS=${ZMAP_WORKERS:-2}
 RESPONSE_THRESHOLD=${RESPONSE_THRESHOLD:-0.75}
 TIMEOUT_MODEL=${TIMEOUT_MODEL:-7200}
-TIMEOUT_ACTIVE=${TIMEOUT_ACTIVE:-21600}
 TIMEOUT_TRAP=${TIMEOUT_TRAP:-43200}
 SKIP_GENERATION=${SKIP_GENERATION:-0}
 USE_LATEST_SNAPSHOTS=${USE_LATEST_SNAPSHOTS:-0}
@@ -88,7 +85,7 @@ fi
 [ -x "$PYTHON" ] || fail "Python is not executable: $PYTHON"
 [ -f "$ROOT/data/latestv6.dat" ] || fail "missing BGP database: $ROOT/data/latestv6.dat"
 cd "$ROOT" || fail "cannot enter $ROOT"
-log "BEGIN run_id=$RUN_ID date=$TASK_DATE threshold=$RESPONSE_THRESHOLD snapshots=$USE_LATEST_SNAPSHOTS"
+log "BEGIN run_id=$RUN_ID date=$TASK_DATE threshold=$RESPONSE_THRESHOLD snapshots=$USE_LATEST_SNAPSHOTS mode=direct-trap"
 
 if [ "$SKIP_GENERATION" != 1 ]; then
     for proto in "${PROTOS[@]}"; do
@@ -122,49 +119,32 @@ for proto in "${PROTOS[@]}"; do
     zmap_dir="$run_dir/zmap"
     mkdir -p "$generated_dir" "$zmap_dir"
     source_file=${SOURCES[$proto]}
-    active_input="$run_dir/input.txt"
+    trap_input="$run_dir/trap-input.txt"
 
     if [ "$USE_LATEST_SNAPSHOTS" = 1 ] || [ "${SHORTEN_INPUTS:-0}" = 1 ]; then
         run_required "shortest input $proto" 3600 \
             "$PYTHON" "$ROOT/tools/select_shortest_prefixes.py" \
-            --input "$source_file" --output "$active_input"
+            --input "$source_file" --output "$trap_input"
     else
-        cp "$source_file" "$active_input" || fail "cannot snapshot $proto input"
+        cp "$source_file" "$trap_input" || fail "cannot snapshot $proto input"
     fi
-
-    active_file="$run_dir/active.txt"
-    run_required "active $proto" "$TIMEOUT_ACTIVE" \
-        "$PYTHON" "$ROOT/ipv6_bulk_zmap_scan_nibble.py" \
-        --input "$active_input" --output-frp "$active_file" \
-        --out-json "$run_dir/active.json" --run-id "$RUN_ID" \
-        --protocol "$SCAN_PROTOCOL" --port "$SCAN_PORT" \
-        --interface "$INTERFACE" --local-ipv6 "$LOCAL_IPV6" --zmap-bin "$ZMAP_BIN" \
-        --dns-domain "$DNS_DOMAIN" --bgp-dat "$ROOT/data/latestv6.dat" \
-        --generated-folder "$generated_dir" --zmap-folder "$zmap_dir" \
-        --rate "$SCAN_RATE" --bgp-rate "$BGP_RATE" --as-rate "$AS_RATE" \
-        --batch-targets "$BATCH_TARGETS" --workers "$ZMAP_WORKERS" \
-        --response-threshold "$RESPONSE_THRESHOLD"
 
     trap_file="$run_dir/trap-full.txt"
-    if [ -s "$active_file" ]; then
-        cp "$active_file" "$trap_file" || fail "cannot initialize $proto trap output"
-        run_required "trap $proto" "$TIMEOUT_TRAP" \
-            "$PYTHON" "$ROOT/trap_det/trap.py" \
-            --predict_path "$active_file" --bgp-dat "$ROOT/data/latestv6.dat" \
-            --local_ipv6 "$LOCAL_IPV6" --generated_folder "$generated_dir" \
-            --zmap_folder "$zmap_dir" --outputfrp "$trap_file" \
-            --protocol "$SCAN_PROTOCOL" --port "$SCAN_PORT" --dns-domain "$DNS_DOMAIN" \
-            --response-threshold "$RESPONSE_THRESHOLD" --batch-rate "$SCAN_RATE" \
-            --bgp-rate "$BGP_RATE" --as-rate "$AS_RATE" --batch-targets "$BATCH_TARGETS"
-    else
-        : > "$trap_file"
-        log "SKIP trap $proto: active result is empty"
-    fi
+    : > "$trap_file" || fail "cannot initialize $proto trap output"
+    run_required "trap $proto" "$TIMEOUT_TRAP" \
+        "$PYTHON" "$ROOT/trap_det/trap.py" \
+        --predict_path "$trap_input" --bgp-dat "$ROOT/data/latestv6.dat" \
+        --local_ipv6 "$LOCAL_IPV6" --generated_folder "$generated_dir" \
+        --zmap_folder "$zmap_dir" --outputfrp "$trap_file" \
+        --protocol "$SCAN_PROTOCOL" --port "$SCAN_PORT" --dns-domain "$DNS_DOMAIN" \
+        --interface "$INTERFACE" \
+        --response-threshold "$RESPONSE_THRESHOLD" --batch-rate "$SCAN_RATE" \
+        --bgp-rate "$BGP_RATE" --as-rate "$AS_RATE" --batch-targets "$BATCH_TARGETS"
 
     run_required "shortest output $proto" 3600 \
         "$PYTHON" "$ROOT/tools/select_shortest_prefixes.py" \
         --input "$trap_file" --output "$run_dir/final.txt"
-    log "COUNTS $proto input=$(wc -l < "$active_input") active=$(wc -l < "$active_file") trap=$(wc -l < "$trap_file") final=$(wc -l < "$run_dir/final.txt")"
+    log "COUNTS $proto input=$(wc -l < "$trap_input") trap=$(wc -l < "$trap_file") final=$(wc -l < "$run_dir/final.txt")"
 done
 
 # Publication starts only after every protocol has completed successfully.

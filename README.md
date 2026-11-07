@@ -64,7 +64,7 @@ python Strategy.py
 
 ### 4. Online Scanning (Adaptive Threshold Probing)
 
-`adaptive_probe.py` implements single-round Online Scanning with a bounded, two-worker ZMap pipeline. A threshold of 100% (`response_threshold=1.0`) corresponds to the paper's 16/16 acceptance rule; lower thresholds are configurable alternatives. No child prefix is expanded. For subsequent BGP-guided multi-round granularity correction, use `trap_det/trap.py` as described below.
+`adaptive_probe.py` implements single-round Online Scanning with a bounded, two-worker ZMap pipeline. A threshold of 100% (`response_threshold=1.0`) corresponds to the paper's 16/16 acceptance rule; lower thresholds are configurable alternatives. No child prefix is expanded. This remains available as a standalone confirmation pipeline, but `run_week.sh` no longer invokes it; the long-running path sends candidates directly to `trap_det/trap.py` for threshold checking plus granularity correction.
 
 The pipeline works as follows:
 
@@ -140,7 +140,7 @@ python ipv6_bulk_zmap_scan_nibble.py \
     --as-rate 0 --batch-targets 0 --workers 2
 ```
 
-`run_week.sh` schedules ICMPv6, TCP80, TCP443, and UDP53 sequentially so their limits do not stack. Its default long-running path is `make_Prediction → Strategy → active scanning → granularity correction`. Every protocol runs in `/home/wct/Gungnir_result/<run_id>/`; only after all four succeed are the shortest covering results atomically published under `server_gungnir`. Any failed stage prevents publication of a partial four-protocol set.
+`run_week.sh` schedules ICMPv6, TCP80, TCP443, and UDP53 sequentially so their limits do not stack. Its default long-running path is `make_Prediction → Strategy → shortest input → granularity correction`. The separate active-confirmation pass is intentionally skipped: candidates go directly to `trap_det/trap.py`, which performs the threshold checks while correcting granularity. Every protocol runs in `/home/wct/Gungnir_result/<run_id>/`; only after all four succeed are the shortest covering results atomically published under `server_gungnir`. Any failed stage prevents publication of a partial four-protocol set.
 
 To refresh from the latest existing four snapshots without rerunning the model or consuming the much larger `PredictionFRP` files:
 
@@ -149,7 +149,7 @@ SKIP_GENERATION=1 USE_LATEST_SNAPSHOTS=1 UPLOAD_RESULTS=1 \
 RESPONSE_THRESHOLD=0.75 /home/wct/Gungnir/run_week.sh
 ```
 
-This mode freezes and hashes all four input snapshot paths before scanning, applies shortest-cover filtering before active scanning and after granularity correction, and invokes `/home/wct/upload/run.sh` only after all four final files are published. Set `UPLOAD_RESULTS=0` to keep results local. The optional 75% mode used by the scheduler is not the paper's 100% baseline.
+This mode freezes and hashes all four input snapshot paths before scanning, applies shortest-cover filtering before and after granularity correction, and invokes `/home/wct/upload/run.sh` only after all four final files are published. Set `UPLOAD_RESULTS=0` to keep results local. The optional 75% mode used by the scheduler is not the paper's 100% baseline.
 
 
 ### 5. Granularity Correction
