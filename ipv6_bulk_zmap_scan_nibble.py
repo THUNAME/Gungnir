@@ -59,10 +59,10 @@ def parse_args():
         parser.error("the production UDP probe currently supports only UDP/53")
     if not args.dns_domain.strip():
         parser.error("--dns-domain must not be empty")
-    if args.rate < 0 or args.batch_targets <= 0 or args.workers not in {1, 2}:
+    if args.rate < 0 or args.batch_targets < 0 or args.workers not in {1, 2}:
         parser.error(
-            "--rate must be non-negative (0 disables the global cap), "
-            "--batch-targets must be positive, and workers must be 1 or 2"
+            "--rate and --batch-targets must be non-negative "
+            "(0 means unlimited), and workers must be 1 or 2"
         )
     if not all(math.isfinite(value) for value in (args.bgp_rate, args.as_rate)):
         parser.error("BGP/AS rates must be finite")

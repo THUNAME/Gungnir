@@ -232,7 +232,7 @@ DEFAULT_BATCH_WINDOW = 20.0
 
 def _batch_window(config):
     # 全局速率设为 0 时仍使用固定 20 秒配额窗口；聚合速率由各 BGP 配额自然形成。
-    if config['batch_rate']:
+    if config['batch_rate'] and config['batch_targets']:
         global_window = config['batch_targets'] / config['batch_rate']
     else:
         global_window = DEFAULT_BATCH_WINDOW
@@ -278,6 +278,15 @@ def scan_target_batch(config, records):
 def _take_rate_limited_batch(config, states, queue):
     batch_targets = config['batch_targets']
     window = _batch_window(config)
+    global_quota = (
+        max(1, int(config['batch_rate'] * window))
+        if config['batch_rate'] else None
+    )
+    limits = [
+        value for value in (batch_targets or None, global_quota)
+        if value is not None
+    ]
+    batch_limit = min(limits) if limits else None
     bgp_quota = max(1, int(config['bgp_rate'] * window))
     as_quota = (
         max(1, int(config['as_rate'] * window))
@@ -288,7 +297,7 @@ def _take_rate_limited_batch(config, states, queue):
     records = []
     deferred = []
 
-    while queue and len(records) < batch_targets:
+    while queue and (batch_limit is None or len(records) < batch_limit):
         prefix = queue.popleft()
         state = states[prefix]
         address = state['samples'][state['sent']]
@@ -591,7 +600,10 @@ def main():
         "--as-rate", type=float, default=0,
         help="批量模式每 AS 时间窗平均 pps；设为 0 表示不限速"
     )
-    parser.add_argument("--batch-targets", type=int, default=100000, help="每批最大目标地址数")
+    parser.add_argument(
+        "--batch-targets", type=int, default=0,
+        help="每批最大目标地址数；0 表示不限制，仅由 BGP/AS 窗口配额决定"
+    )
     parser.add_argument(
         "--no-early-stop", action="store_true",
         help="批量模式发送全部样本，不在结论已确定时提前停止"
@@ -619,8 +631,8 @@ def main():
         or args.bgp_rate <= 0 or args.as_rate < 0
     ):
         parser.error("--bgp-rate 必须为正数，--as-rate 必须为非负数（0 表示不限速）")
-    if args.batch_targets <= 0:
-        parser.error("--batch-targets 必须是正整数")
+    if args.batch_targets < 0:
+        parser.error("--batch-targets 必须是非负整数（0 表示不限制）")
     if not args.dns_domain:
         parser.error("--dns-domain 不能为空")
     ipaddress.IPv6Address(args.local_ipv6)

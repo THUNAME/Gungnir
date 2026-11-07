@@ -22,7 +22,8 @@ DEFAULT_RESPONSE_THRESHOLD = 0.75
 # 全局速率 0 表示不设总速率上限，仅由每 BGP/AS 配额约束聚合速率。
 DEFAULT_SCAN_RATE_PPS = 0
 DEFAULT_BGP_RATE_PPS = 10.0
-DEFAULT_BATCH_TARGETS = 100000
+# 0 表示不限制单批目标数；一个窗口内可调度全部 BGP 的配额。
+DEFAULT_BATCH_TARGETS = 0
 DEFAULT_AS_RATE_PPS = 0.0
 DEFAULT_WINDOW_SECONDS = 20.0
 DEFAULT_ZMAP_WORKERS = 2
@@ -305,8 +306,8 @@ class AdaptiveFrpPipeline:
                 "global rate must be non-negative (0 disables the cap), "
                 "BGP rate must be positive, AS rate non-negative"
             )
-        if batch_targets <= 0:
-            raise ValueError("batch_targets must be positive")
+        if batch_targets < 0:
+            raise ValueError("batch_targets must be non-negative (0 is unlimited)")
         if zmap_workers not in (1, 2):
             raise ValueError("zmap_workers must be 1 or 2")
         if consumer is not None and zmap_workers != 1:
@@ -324,7 +325,7 @@ class AdaptiveFrpPipeline:
             1 / bgp_rate_pps,
             1 / as_rate_pps if as_rate_pps else 0.0,
         ]
-        if scan_rate_bps:
+        if scan_rate_bps and batch_targets:
             window_parts.append(batch_targets / scan_rate_bps)
         else:
             window_parts.append(DEFAULT_WINDOW_SECONDS)
@@ -431,27 +432,33 @@ class AdaptiveFrpPipeline:
             max(1, int(self.as_rate_pps * self.window_seconds))
             if self.as_rate_pps else None
         )
-        bgp_remaining: dict[str, int] = {}
-        as_remaining: dict[str, int] = {}
         batches = []
+        worker_count = max(1, len(worker_ids))
+        # 将每 BGP/AS 的窗口配额公平拆分给并发 worker，避免首个 worker 吃完全部配额。
+        worker_bgp_quota = max(1, math.ceil(bgp_quota / worker_count))
+        worker_as_quota = (
+            max(1, math.ceil(as_quota / worker_count))
+            if as_quota is not None else None
+        )
+        pending_targets = sum(len(group) for group in self.groups.values())
 
         for worker_id in worker_ids:
             if (
                 global_remaining is not None and global_remaining <= 0
             ) or not self._has_pending():
                 break
-            capacity = self.batch_targets
+            capacity = self.batch_targets or pending_targets
             if global_remaining is not None:
                 capacity = min(capacity, global_remaining)
             records = self._take_targets(
                 capacity,
-                bgp_quota,
-                bgp_remaining,
-                as_quota,
-                as_remaining,
+                worker_bgp_quota,
+                {},
+                worker_as_quota,
+                {},
             )
             if not records:
-                break
+                continue
             rate_pps = max(1, int(len(records) / self.window_seconds))
             if self.scan_rate_bps:
                 rate_pps = min(self.scan_rate_bps, rate_pps)
