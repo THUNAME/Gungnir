@@ -19,10 +19,12 @@ except ImportError:
 
 
 DEFAULT_RESPONSE_THRESHOLD = 0.75
-DEFAULT_SCAN_RATE_PPS = 5000
+# 全局速率 0 表示不设总速率上限，仅由每 BGP/AS 配额约束聚合速率。
+DEFAULT_SCAN_RATE_PPS = 0
 DEFAULT_BGP_RATE_PPS = 10.0
 DEFAULT_BATCH_TARGETS = 100000
 DEFAULT_AS_RATE_PPS = 0.0
+DEFAULT_WINDOW_SECONDS = 20.0
 DEFAULT_ZMAP_WORKERS = 2
 ROOT = Path(__file__).resolve().parent
 _PREFIX_MASKS = tuple(
@@ -242,7 +244,8 @@ class ZMapConsumer:
             zmap_path=str(zmap_path),
             gateway_mac=self.config.get("gateway_mac")
             or os.environ.get("GUNGNIR_GATEWAY_MAC"),
-            rate_pps=scan_rate_bps,
+            # 全局速率关闭时工厂仍需一个占位值；每个批次会在 scan() 中覆盖它。
+            rate_pps=scan_rate_bps or 1,
             protocol=protocol,
             port=port,
             dns_domain=str(self.config.get("dns_domain", "example.com")),
@@ -297,8 +300,11 @@ class AdaptiveFrpPipeline:
         numeric_rates = (scan_rate_bps, bgp_rate_pps, as_rate_pps)
         if not all(math.isfinite(value) for value in numeric_rates):
             raise ValueError("rate values must be finite")
-        if scan_rate_bps <= 0 or bgp_rate_pps <= 0 or as_rate_pps < 0:
-            raise ValueError("global/BGP rates must be positive and AS rate non-negative")
+        if scan_rate_bps < 0 or bgp_rate_pps <= 0 or as_rate_pps < 0:
+            raise ValueError(
+                "global rate must be non-negative (0 disables the cap), "
+                "BGP rate must be positive, AS rate non-negative"
+            )
         if batch_targets <= 0:
             raise ValueError("batch_targets must be positive")
         if zmap_workers not in (1, 2):
@@ -313,11 +319,16 @@ class AdaptiveFrpPipeline:
         self.batch_targets = batch_targets
         self.as_rate_pps = as_rate_pps
         self.early_stop = early_stop
-        self.window_seconds = max(
-            batch_targets / scan_rate_bps,
+        # 全局速率关闭时仍保留 20 秒配额窗口，避免每 BGP 配额被压缩成极短窗口。
+        window_parts = [
             1 / bgp_rate_pps,
             1 / as_rate_pps if as_rate_pps else 0.0,
-        )
+        ]
+        if scan_rate_bps:
+            window_parts.append(batch_targets / scan_rate_bps)
+        else:
+            window_parts.append(DEFAULT_WINDOW_SECONDS)
+        self.window_seconds = max(window_parts)
         generated_dir = Path(
             self.config.get("generated_folder_path", "scanningdata/generated_address")
         )
@@ -411,7 +422,10 @@ class AdaptiveFrpPipeline:
         return records
 
     def _produce_window(self, worker_ids: list[int]) -> list[ProbeBatch]:
-        global_remaining = max(1, int(self.scan_rate_bps * self.window_seconds))
+        global_remaining = (
+            max(1, int(self.scan_rate_bps * self.window_seconds))
+            if self.scan_rate_bps else None
+        )
         bgp_quota = max(1, int(self.bgp_rate_pps * self.window_seconds))
         as_quota = (
             max(1, int(self.as_rate_pps * self.window_seconds))
@@ -422,10 +436,15 @@ class AdaptiveFrpPipeline:
         batches = []
 
         for worker_id in worker_ids:
-            if global_remaining <= 0 or not self._has_pending():
+            if (
+                global_remaining is not None and global_remaining <= 0
+            ) or not self._has_pending():
                 break
+            capacity = self.batch_targets
+            if global_remaining is not None:
+                capacity = min(capacity, global_remaining)
             records = self._take_targets(
-                min(self.batch_targets, global_remaining),
+                capacity,
                 bgp_quota,
                 bgp_remaining,
                 as_quota,
@@ -434,16 +453,19 @@ class AdaptiveFrpPipeline:
             if not records:
                 break
             rate_pps = max(1, int(len(records) / self.window_seconds))
+            if self.scan_rate_bps:
+                rate_pps = min(self.scan_rate_bps, rate_pps)
             batch = self.producer.produce_targets(
                 targets=records,
                 batch_id=self._next_batch_id,
                 worker_id=worker_id,
-                rate_pps=min(self.scan_rate_bps, rate_pps),
+                rate_pps=rate_pps,
                 window_seconds=self.window_seconds,
             )
             self._next_batch_id += 1
             batches.append(batch)
-            global_remaining -= len(records)
+            if global_remaining is not None:
+                global_remaining -= len(records)
         return batches
 
     def _process_future(self, future: Future, futures: dict[Future, ProbeBatch]) -> None:
@@ -502,6 +524,10 @@ class AdaptiveFrpPipeline:
             "early_reject": self._early_reject,
             "workers": len(self.consumers),
             "window_seconds": self.window_seconds,
+            "global_rate_pps": self.scan_rate_bps,
+            "bgp_rate_pps": self.bgp_rate_pps,
+            "as_rate_pps": self.as_rate_pps,
+            "batch_targets": self.batch_targets,
         }
 
     def run(self, prefix_set: set[str] | list[str] | tuple[str, ...]) -> set[str]:

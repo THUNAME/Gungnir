@@ -71,7 +71,7 @@ The pipeline works as follows:
 - Normalize and deduplicate input prefixes, then use integer masks to generate each next sample on demand. Samples cover the `0-f` child prefixes when space permits; smaller address spaces are enumerated completely.
 - A central work-conserving scheduler queues targets by BGP prefix and interleave eligible groups. An idle or exhausted BGP group does not block other groups.
 - At most two ZMap workers run concurrently, allowing one worker to send while the other is in cooldown. Target generation, result parsing, and threshold updates overlap with scanning.
-- All workers share one 20-second accounting window. The default limits are 5000 packets/s globally, 10 packets/s per BGP prefix, and 100000 addresses per batch. Per-AS pacing is disabled by default (`as_rate_pps=0`). Thus a shared default window contains at most 100000 targets globally and 200 targets per BGP prefix, not those amounts per worker.
+- All workers share one 20-second accounting window. The global packet-rate cap is disabled by default (`scan_rate_bps=0`); only the per-BGP limit of 10 packets/s is applied by default, so the aggregate rate emerges from the number of eligible BGP groups. Per-AS pacing is also disabled (`as_rate_pps=0`). A default window therefore allows up to 200 targets per BGP prefix. `batch_targets=100000` remains a per-worker batching capacity, not a global packet-rate cap; with two workers the scheduler can submit up to two such batches in one shared window.
 - Each prefix stores its sent and responsive counts. With early stopping enabled, `hits >= ceil(total × response_threshold)` accepts immediately, while `hits + remaining < required` rejects immediately. At 0.75 this means 12 responses or five missing responses; at 1.0 the first missing address rejects. Set `early_stop=False` to send every sample.
 
 These are shared time-window average limits, not a strict per-packet token bucket. Each batch logs its target count, assigned rate, remaining work, eligible BGP groups, and elapsed time.
@@ -112,7 +112,7 @@ frp_set = checkFrp(
     config,
     prefixes,
     response_threshold=0.75,
-    scan_rate_bps=5000,  # Historical name; the value is packets/s.
+    scan_rate_bps=0,     # Historical name; 0 disables the global packets/s cap.
     bgp_rate_pps=10,
     batch_targets=100000,
     as_rate_pps=0,
@@ -136,7 +136,7 @@ python ipv6_bulk_zmap_scan_nibble.py \
     --bgp-dat data/latestv6.dat \
     --generated-folder /tmp/gungnir/generated \
     --zmap-folder /tmp/gungnir/results \
-    --response-threshold 0.75 --rate 5000 --bgp-rate 10 \
+    --response-threshold 0.75 --rate 0 --bgp-rate 10 \
     --as-rate 0 --batch-targets 100000 --workers 2
 ```
 
@@ -174,7 +174,7 @@ The current implementation follows the paper's confirmation-and-correction objec
 - **State transition:** move to a responsive parent while retaining the current correction length. After an unsuccessful probe, retain the current prefix and halve the correction length with integer division. Converging branches retain the smallest correction length.
 - **Integer address generation:** generate up to 16 addresses with the same `0-f` child-prefix structure. Prefixes with fewer than 16 available addresses are enumerated completely.
 - **Configurable response threshold and early stopping:** the baseline is 16/16 (`response_threshold=1.0`). The threshold can be configured when a different acceptance ratio is desired, using `ceil(sample_count * response_threshold)` responses. For example, 0.75 requires 12 responses and permits rejection after five missing responses. Early stopping avoids sending probes that can no longer change the selected threshold's decision.
-- **Hierarchical rate control:** limit the global, per-BGP, and per-AS batch-window rates, interleave targets, and reduce the rate of sparse batches. This is operational pacing rather than a claim made by the paper.
+- **Hierarchical rate control:** limit only the per-BGP rate by default, interleave all eligible BGP groups, and reduce the rate of sparse batches. An optional global cap, per-AS pacing, and sparse-batch pacing are operational controls rather than claims made by the paper.
 
 To reproduce the paper's 16/16 acceptance rule and its full 16-address probing behavior, set `response_threshold=1.0` and disable early stopping:
 
@@ -189,7 +189,7 @@ python trap_det/trap.py \
     --protocol icmp \
     --response-threshold 1.0 \
     --no-early-stop \
-    --batch-rate 5000 \
+    --batch-rate 0 \
     --bgp-rate 10 \
     --as-rate 0 \
     --batch-targets 100000
@@ -197,9 +197,9 @@ python trap_det/trap.py \
 
 For the optional 75% mode, use `--response-threshold 0.75` and omit `--no-early-stop`. At threshold 1.0, early stopping after the first missing address is logically equivalent to the 16/16 decision, but it changes the number of probes and should be disabled when comparing against the paper's budget accounting.
 
-The batch scheduler defaults to a global maximum of 5000 packets/s, 10 packets/s per BGP prefix, no per-AS rate limit (`--as-rate 0`), and 100000 addresses per batch. The default window is therefore 20 seconds, allowing up to 200 addresses per BGP prefix per batch. Set `--as-rate` to a positive value to enable per-AS pacing. Each batch invokes one ZMap process and pays its cooldown once. These are batch-window average limits, not a per-packet kernel token bucket.
+The batch scheduler defaults to no global packet-rate cap (`--batch-rate 0`), 10 packets/s per BGP prefix, no per-AS rate limit (`--as-rate 0`), and 100000 addresses per batch. The fixed default accounting window is 20 seconds, allowing up to 200 addresses per BGP prefix per window. All eligible BGP groups are interleaved, so aggregate throughput grows with the number of eligible BGP prefixes. Set `--batch-rate` to a positive value to restore an explicit global cap, and set `--as-rate` to a positive value to enable per-AS pacing. Each batch invokes one ZMap process and pays its cooldown once. These are batch-window average limits, not a per-packet kernel token bucket.
 
-Set `--batch-rate 0` to disable the new batch scheduler. The legacy single-batch path and independent per-prefix mode remain available; when using `--per-prefix-rate`, also set `--batch-rate 0`.
+`--batch-rate 0` keeps the batch scheduler enabled and only disables its global cap. Independent per-prefix mode remains available through `--per-prefix-rate`; when using that mode, also set `--batch-rate 0`.
 
 ZMap is invoked with `sudo -n`, so non-interactive privilege must be configured in advance. UDP/53 uses the `ipv6_dns` module and `--dns-domain`. Any nonzero ZMap status or missing metadata aborts the scan rather than being treated as an empty result. Only probe networks that you are authorized to measure.
 

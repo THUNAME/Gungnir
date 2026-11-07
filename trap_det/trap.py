@@ -227,11 +227,16 @@ def _interleave_rate_groups(records):
     return interleaved
 
 
+DEFAULT_BATCH_WINDOW = 20.0
+
+
 def _batch_window(config):
-    window = max(
-        config['batch_targets'] / config['batch_rate'],
-        1 / config['bgp_rate'],
-    )
+    # 全局速率设为 0 时仍使用固定 20 秒配额窗口；聚合速率由各 BGP 配额自然形成。
+    if config['batch_rate']:
+        global_window = config['batch_targets'] / config['batch_rate']
+    else:
+        global_window = DEFAULT_BATCH_WINDOW
+    window = max(global_window, 1 / config['bgp_rate'])
     if config.get('as_rate'):
         window = max(window, 1 / config['as_rate'])
     return window
@@ -249,9 +254,12 @@ def scan_target_batch(config, records):
     local_config = config.copy()
     local_config['generated_address_path'] = gen_tmp.name
     local_config['zmap_result_path'] = zmap_tmp.name
-    # 稀疏批次同步降速，避免少量同组目标仍在全局高速率下形成突发。
+    # 稀疏批次同步降速；未设置全局速率时，速率完全由本批目标数与时间窗决定。
     paced_rate = max(1, int(len(records) / _batch_window(config)))
-    local_config['rate'] = min(config['batch_rate'], paced_rate)
+    local_config['rate'] = (
+        min(config['batch_rate'], paced_rate)
+        if config['batch_rate'] else paced_rate
+    )
 
     try:
         with open(gen_tmp.name, 'w') as f:
@@ -375,8 +383,8 @@ def checkFrp(config, prefix_set):
         raise ValueError("没有可扫描的前缀")
     if config.get('per_prefix_rate') is not None:
         return check_frp_per_prefix(config, prefix_set)
-    if config.get('batch_rate'):
-        return check_frp_batch(config, prefix_set)
+    # 默认使用批量分层调度；batch_rate=0 仅关闭全局速率上限，不再关闭批量模式。
+    return check_frp_batch(config, prefix_set)
 
     # 每次生成两条新的临时文件路径 —— 始终覆盖旧的，不删除 config 的 key
     gen_tmp = tempfile.NamedTemporaryFile(delete=False, dir=config['generated_folder_path'], suffix=".txt")
@@ -575,8 +583,8 @@ def main():
     parser.add_argument("--per-prefix-rate", type=int, help="每个前缀独立的 ZMap pps")
     parser.add_argument("--prefix-workers", type=int, default=4, help="逐前缀扫描的最大并发数")
     parser.add_argument(
-        "--batch-rate", type=int, default=5000,
-        help="批量模式的全局最高 ZMap pps；设为 0 可禁用批量模式"
+        "--batch-rate", type=int, default=0,
+        help="批量模式的全局最高 ZMap pps；0 表示不限全局速率，仅保留 BGP/AS 配额"
     )
     parser.add_argument("--bgp-rate", type=float, default=10, help="批量模式每 BGP 时间窗平均 pps")
     parser.add_argument(
@@ -605,7 +613,7 @@ def main():
     if args.batch_rate is not None and args.batch_rate < 0:
         parser.error("--batch-rate 必须是非负整数")
     if args.batch_rate and args.per_prefix_rate is not None:
-        parser.error("--batch-rate 与 --per-prefix-rate 不能同时使用；逐前缀模式请设 --batch-rate 0")
+        parser.error("--per-prefix-rate 模式请将 --batch-rate 设为 0")
     if (
         not math.isfinite(args.bgp_rate) or not math.isfinite(args.as_rate)
         or args.bgp_rate <= 0 or args.as_rate < 0
